@@ -1,0 +1,28 @@
+{
+	admin off
+}
+
+# Локальная разработка: HTTP без TLS.
+# На сервере адрес меняется на `video.example.com:8443` с блоком tls/dns —
+# сертификат выпускается через DNS-01, потому что 80 и 443 заняты (раздел 4.3).
+:8080 {
+	encode zstd gzip
+
+	# Готовые файлы уходят с диска мимо приложения — раздел 6 плана.
+	handle_path /files/* {
+		root * /srv/media
+		file_server
+	}
+
+	@app path /api/* /healthz /docs /docs/* /openapi.json
+	handle @app {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		root * /srv/www
+		file_server
+	}
+
+	log
+}

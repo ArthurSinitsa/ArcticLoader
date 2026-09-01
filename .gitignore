@@ -1,0 +1,13 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+CLAUDE.md
+.env
+
+# Скачанные файлы и временные потоки yt-dlp
+data/
+*.part
+*.ytdl

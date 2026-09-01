@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Arctic Loader</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+    form { display: flex; gap: .5rem; }
+    input { flex: 1; padding: .5rem; }
+    #state { margin-top: 1.5rem; }
+    progress { width: 100%; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>Arctic Loader</h1>
+
+  <form id="form">
+    <input id="url" type="url" placeholder="Ссылка на видео" required autofocus>
+    <button type="submit">Скачать</button>
+  </form>
+
+  <div id="state"></div>
+
+  <script>
+    // Временная страница Этапа 1: опрос статуса раз в секунду.
+    // На Этапе 2 опрос заменит SSE, на Этапе 7 — React + PWA.
+    const POLL_INTERVAL_MS = 1000;
+    const TERMINAL = ["ready", "failed", "cancelled", "expired"];
+
+    const form = document.getElementById("form");
+    const urlInput = document.getElementById("url");
+    const state = document.getElementById("state");
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      state.textContent = "Отправляю…";
+
+      try {
+        const created = await request("/api/downloads", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: urlInput.value }),
+        });
+        poll(created.task_id);
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+
+    async function poll(taskId) {
+      try {
+        const task = await request(`/api/downloads/${taskId}`);
+        render(task);
+        if (!TERMINAL.includes(task.status)) {
+          setTimeout(() => poll(taskId), POLL_INTERVAL_MS);
+        }
+      } catch (error) {
+        showError(error.message);
+      }
+    }
+
+    function render(task) {
+      if (task.status === "ready") {
+        state.innerHTML = "";
+        const link = document.createElement("a");
+        link.href = task.download_url;
+        link.download = "";
+        link.textContent = `Скачать: ${task.title ?? "видео"}`;
+        state.append(`Готово (${formatSize(task.file_size)}). `, link);
+        return;
+      }
+
+      if (task.status === "failed") {
+        showError(`${task.error_code}: ${task.error_message ?? "без описания"}`);
+        return;
+      }
+
+      state.innerHTML = `<div>${task.status}: ${task.title ?? task.source_url}</div>`;
+      const bar = document.createElement("progress");
+      bar.max = 100;
+      bar.value = task.progress;
+      state.append(bar, ` ${task.progress.toFixed(1)}%`);
+    }
+
+    async function request(url, options) {
+      const response = await fetch(url, options);
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail ?? `HTTP ${response.status}`);
+      }
+      return response.json();
+    }
+
+    function formatSize(bytes) {
+      return bytes ? `${(bytes / 1024 / 1024).toFixed(1)} МБ` : "размер неизвестен";
+    }
+
+    function showError(message) {
+      state.innerHTML = "";
+      const box = document.createElement("div");
+      box.className = "error";
+      box.textContent = `Ошибка: ${message}`;
+      state.append(box);
+    }
+  </script>
+</body>
+</html>

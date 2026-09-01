@@ -1,0 +1,75 @@
+name: arcticloader
+
+x-backend: &backend
+  build:
+    context: ./backend
+    target: dev
+  env_file: .env
+  volumes:
+    # Код монтируется с хоста: правки подхватываются без пересборки образа.
+    - ./backend:/app
+    - ./data/media:/srv/media
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-arctic}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-arctic}
+      POSTGRES_DB: ${POSTGRES_DB:-arctic}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-arctic}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Очередь и прогресс переживут перезапуск воркеров, но не машины —
+    # персистентность здесь не нужна и только изнашивает SSD.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    <<: *backend
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *backend
+    command: ["arq", "app.worker.settings.WorkerSettings"]
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend:/srv/www:ro
+      - ./data/media:/srv/media:ro
+      - caddy_data:/data
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
