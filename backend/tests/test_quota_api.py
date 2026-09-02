@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings
 from app.models import Task, TaskStatus
 from tests.conftest import FakeArqPool
+from tests.test_auth import add_user, login
 
 URL = "https://example.com/video.mp4"
 ANOTHER_URL = "https://example.com/second.mp4"
@@ -129,3 +130,45 @@ async def test_guest_access_switch_closes_anonymous_downloads(
     response = await client.post("/api/downloads", json=_payload())
 
     assert response.status_code == 403
+
+
+async def test_signed_in_user_gets_the_quota_of_their_role(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Пользователю положены четыре параллельные загрузки против одной у гостя."""
+    await add_user(session_factory)
+    await login(client)
+
+    first = await client.post("/api/downloads", json=_payload())
+    second = await client.post("/api/downloads", json=_payload(ANOTHER_URL))
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+
+
+async def test_task_belongs_to_the_signed_in_user(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """История загрузок строится по user_id — отпечаток тут уже ни при чём."""
+    user = await add_user(session_factory)
+    await login(client)
+
+    await client.post("/api/downloads", json=_payload())
+
+    async with session_factory() as session:
+        task = await session.scalar(sa.select(Task))
+    assert task.user_id == user.id
+    assert task.guest_fingerprint is None
+
+
+async def test_user_quota_is_not_shared_with_guests(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Гостевая квота того же браузера не должна съедать пользовательскую."""
+    await client.post("/api/downloads", json=_payload())
+    await add_user(session_factory)
+    await login(client)
+
+    response = await client.post("/api/downloads", json=_payload(ANOTHER_URL))
+
+    assert response.status_code == 202

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 from app.models import TaskStatus
 from app.services.formats import DEFAULT_QUALITY, Quality
@@ -59,3 +59,27 @@ class FormatsResponse(BaseModel):
     extractor: str
     duration: float | None
     options: list[QualityOptionOut]
+
+
+class LoginRequest(BaseModel):
+    #: Не `EmailStr`: валидация адреса — забота того, кто заводит учётку,
+    #: а на входе лишний пакет ради проверки формата не нужен.
+    email: str
+    password: str
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    #: Восемь символов — нижняя граница, ниже которой пароль перебирается
+    #: быстрее, чем успеет сработать блокировка входа.
+    new_password: str = Field(min_length=8)
+
+
+class CurrentUser(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    email: str
+    name: str
+    must_change_password: bool
+    role: str

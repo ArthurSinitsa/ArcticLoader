@@ -14,10 +14,40 @@
     progress { width: 100%; }
     .error { color: #b00020; }
     .hint { color: #666; font-size: .875rem; }
+    .hidden { display: none; }
+    .account { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; }
+    #login-form input, #password-form input { flex: 1; }
   </style>
 </head>
 <body>
   <h1>Arctic Loader</h1>
+
+  <div id="account" class="account hidden">
+    <span id="who" class="hint"></span>
+    <button type="button" id="signin">Вход</button>
+    <button type="button" id="signout" class="hidden">Выход</button>
+  </div>
+
+  <form id="login-form" class="hidden">
+    <div class="row">
+      <input id="login-email" type="email" placeholder="Email" autocomplete="username" required>
+      <input id="login-password" type="password" placeholder="Пароль"
+             autocomplete="current-password" required>
+      <button type="submit">Войти</button>
+    </div>
+    <div class="hint">Регистрация — через администратора: публичной формы нет.</div>
+  </form>
+
+  <form id="password-form" class="hidden">
+    <div class="hint">Пароль временный — задайте свой, чтобы продолжить.</div>
+    <div class="row">
+      <input id="password-current" type="password" placeholder="Текущий пароль"
+             autocomplete="current-password" required>
+      <input id="password-new" type="password" placeholder="Новый пароль, от 8 символов"
+             autocomplete="new-password" minlength="8" required>
+      <button type="submit">Сменить</button>
+    </div>
+  </form>
 
   <form id="form">
     <div class="row">
@@ -54,6 +84,77 @@
     const state = document.getElementById("state");
 
     let loadedFor = null;
+
+    const account = document.getElementById("account");
+    const who = document.getElementById("who");
+    const signInButton = document.getElementById("signin");
+    const signOutButton = document.getElementById("signout");
+    const loginForm = document.getElementById("login-form");
+    const passwordForm = document.getElementById("password-form");
+
+    // Гость тоже качает (раздел 2.5.1), поэтому вход — не преграда, а кнопка:
+    // авторизованному просто положены лимиты повыше.
+    refreshAccount();
+
+    signInButton.addEventListener("click", () => toggle(loginForm, true));
+    signOutButton.addEventListener("click", async () => {
+      await fetch("/api/auth/logout", { method: "POST" });
+      refreshAccount();
+    });
+
+    loginForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await request("/api/auth/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: document.getElementById("login-email").value,
+            password: document.getElementById("login-password").value,
+          }),
+        }, true);
+        document.getElementById("login-password").value = "";
+        toggle(loginForm, false);
+        refreshAccount();
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+
+    passwordForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        await request("/api/auth/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            current_password: document.getElementById("password-current").value,
+            new_password: document.getElementById("password-new").value,
+          }),
+        }, true);
+        passwordForm.reset();
+        refreshAccount();
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+
+    async function refreshAccount() {
+      const response = await fetch("/api/auth/me");
+      const user = response.ok ? await response.json() : null;
+
+      account.classList.remove("hidden");
+      who.textContent = user ? `${user.name} · ${user.role}` : "Гость";
+      toggle(signInButton, !user);
+      toggle(signOutButton, Boolean(user));
+      // С временным паролем ничего, кроме его смены, всё равно не работает.
+      toggle(passwordForm, Boolean(user && user.must_change_password));
+      toggle(form, !user || !user.must_change_password);
+    }
+
+    function toggle(element, visible) {
+      element.classList.toggle("hidden", !visible);
+    }
 
     // Список качества зависит от ролика: показывать 1080p там, где его нет,
     // значит обманывать — человек выберет и молча получит 720p.
@@ -166,13 +267,13 @@
       state.append(bar, ` ${task.progress.toFixed(1)}%`);
     }
 
-    async function request(url, options) {
+    async function request(url, options, empty = false) {
       const response = await fetch(url, options);
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
         throw new Error(describeError(body) ?? `HTTP ${response.status}`);
       }
-      return response.json();
+      return empty ? null : response.json();
     }
 
     function describeError(body) {

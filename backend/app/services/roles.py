@@ -88,6 +88,10 @@ async def load_quota(session: AsyncSession, code: RoleCode | str) -> Quota:
         raise LookupError(f"нет квот для роли {code}")
 
     profile, is_unlimited = row
+    return _to_quota(profile, is_unlimited)
+
+
+def _to_quota(profile: QuotaProfile, is_unlimited: bool) -> Quota:
     return Quota(
         daily_limit=profile.daily_limit,
         concurrent_limit=profile.concurrent_limit,
@@ -95,3 +99,21 @@ async def load_quota(session: AsyncSession, code: RoleCode | str) -> Quota:
         bucket_refill_minutes=profile.bucket_refill_minutes,
         unlimited=is_unlimited,
     )
+
+
+async def load_quota_by_role_id(session: AsyncSession, role_id: int) -> tuple[RoleCode, Quota]:
+    """Код роли и её лимиты одним запросом — то, что нужно на каждый запрос
+    авторизованного пользователя."""
+    row = (
+        await session.execute(
+            sa.select(Role.code, Role.is_unlimited, QuotaProfile)
+            .join(QuotaProfile, QuotaProfile.role_id == Role.id)
+            .where(Role.id == role_id)
+        )
+    ).first()
+
+    if row is None:
+        raise LookupError(f"нет квот для роли {role_id}")
+
+    code, is_unlimited, profile = row
+    return RoleCode(code), _to_quota(profile, is_unlimited)

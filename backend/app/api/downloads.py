@@ -41,6 +41,13 @@ async def create_download(
         # Рубильник раздела 3.6: подозрительная активность лечится флагом.
         raise HTTPException(status.HTTP_403_FORBIDDEN, "анонимное скачивание временно отключено")
 
+    if principal.must_change_password:
+        # Временный пароль знает не только владелец (раздел 2.6): до смены
+        # учётка не должна ничего уметь.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "смените временный пароль, чтобы пользоваться сервисом"
+        )
+
     await _check_quota(session, arq, principal)
 
     task = await tasks_repo.create_task(

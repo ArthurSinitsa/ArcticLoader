@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from arq.connections import RedisSettings, create_pool
 from fastapi import FastAPI
 
-from app.api import downloads, formats, health
+from app.api import auth, downloads, formats, health
 from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging_setup import configure_logging
@@ -52,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(title="Arctic Loader", version="0.1.0", lifespan=lifespan)
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(formats.router)
     app.include_router(downloads.router)
     return app

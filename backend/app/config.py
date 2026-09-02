@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     superadmin_password: SecretStr = SecretStr("")
     superadmin_name: str = "Суперадминистратор"
 
+    #: Сессии (раздел 4.4). Неделя со скользящим продлением: пользователь не
+    #: должен вылетать посреди работы, но и вечная cookie не нужна.
+    session_ttl_seconds: int = 7 * 24 * 3600
+    session_cookie_name: str = "arctic_session"
+    #: На проде за TLS — обязательно true; локально сервис работает по HTTP,
+    #: и с secure=true браузер cookie просто не сохранит.
+    session_cookie_secure: bool = False
+
+    #: Защита входа от перебора (раздел 2.6): пять неудач по связке IP + логин
+    #: закрывают вход на пятнадцать минут.
+    login_max_attempts: int = 5
+    login_block_seconds: int = 900
+
     #: Рубильник анонимного скачивания из раздела 3.6. Волна ботов лечится
     #: переключением флага, а не ночным деплоем.
     guest_access_enabled: bool = True
