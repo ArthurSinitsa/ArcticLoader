@@ -7,10 +7,12 @@ from contextlib import asynccontextmanager
 from arq.connections import RedisSettings, create_pool
 from fastapi import FastAPI
 
-from app.api import downloads, health
+from app.api import downloads, formats, health
 from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging_setup import configure_logging
+from app.services.roles import ensure_roles
+from app.services.users import ensure_superadmin
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +26,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.settings = settings
     app.state.session_factory = create_session_factory(engine)
     app.state.arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+
+    # Справочник ролей и первая учётка — на старте, а не миграцией: лимиты
+    # правятся из админки, и второй источник истины в SQL-файле разошёлся бы
+    # с базой после первой же правки.
+    async with app.state.session_factory() as session:
+        await ensure_roles(session)
+        await ensure_superadmin(
+            session,
+            email=settings.superadmin_email,
+            password=settings.superadmin_password.get_secret_value(),
+            name=settings.superadmin_name,
+        )
+
     log.info("Arctic Loader API запущен")
 
     try:
@@ -37,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     app = FastAPI(title="Arctic Loader", version="0.1.0", lifespan=lifespan)
     app.include_router(health.router)
+    app.include_router(formats.router)
     app.include_router(downloads.router)
     return app
 

@@ -7,32 +7,99 @@
   <title>Arctic Loader</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
-    form { display: flex; gap: .5rem; }
+    .row { display: flex; gap: .5rem; margin-bottom: .75rem; }
     input { flex: 1; padding: .5rem; }
+    select { padding: .5rem; min-width: 14rem; }
     #state { margin-top: 1.5rem; }
     progress { width: 100%; }
     .error { color: #b00020; }
+    .hint { color: #666; font-size: .875rem; }
   </style>
 </head>
 <body>
   <h1>Arctic Loader</h1>
 
   <form id="form">
-    <input id="url" type="url" placeholder="Ссылка на видео" required autofocus>
-    <button type="submit">Скачать</button>
+    <div class="row">
+      <input id="url" type="url" placeholder="Ссылка на видео" required autofocus>
+    </div>
+    <div class="row">
+      <select id="quality" disabled>
+        <option>Сначала вставь ссылку</option>
+      </select>
+      <button type="submit" id="submit" disabled>Скачать</button>
+    </div>
   </form>
 
+  <div id="title" class="hint"></div>
   <div id="state"></div>
 
   <script>
-    // Временная страница Этапа 1: опрос статуса раз в секунду.
-    // На Этапе 2 опрос заменит SSE, на Этапе 7 — React + PWA.
-    const POLL_INTERVAL_MS = 1000;
+    // Временная страница: прогресс приходит по SSE. На Этапе 7 — React + PWA.
     const TERMINAL = ["ready", "failed", "cancelled", "expired"];
+    const DEFAULT_QUALITY = "1080p";
+
+    const STATUS_LABELS = {
+      queued: "В очереди",
+      extracting: "Читаю страницу",
+      downloading: "Качаю",
+      processing: "Сшиваю дорожки",
+    };
 
     const form = document.getElementById("form");
     const urlInput = document.getElementById("url");
+    const qualitySelect = document.getElementById("quality");
+    const submitButton = document.getElementById("submit");
+    const titleBox = document.getElementById("title");
     const state = document.getElementById("state");
+
+    let loadedFor = null;
+
+    // Список качества зависит от ролика: показывать 1080p там, где его нет,
+    // значит обманывать — человек выберет и молча получит 720p.
+    urlInput.addEventListener("change", loadFormats);
+    urlInput.addEventListener("blur", loadFormats);
+
+    async function loadFormats() {
+      const url = urlInput.value.trim();
+      if (!url || url === loadedFor) return;
+      loadedFor = url;
+
+      setQualityPlaceholder("Смотрю, что доступно…");
+      titleBox.textContent = "";
+      state.innerHTML = "";
+
+      try {
+        const data = await request(`/api/formats?url=${encodeURIComponent(url)}`);
+        titleBox.textContent = `${data.title} · ${data.extractor}${formatDuration(data.duration)}`;
+        fillQualities(data.options);
+      } catch (error) {
+        loadedFor = null;
+        setQualityPlaceholder("Не удалось получить форматы");
+        showError(error.message);
+      }
+    }
+
+    function fillQualities(options) {
+      qualitySelect.innerHTML = "";
+      for (const option of options) {
+        const element = document.createElement("option");
+        element.value = option.quality;
+        element.textContent = option.filesize
+          ? `${option.label} — ${formatSize(option.filesize)}`
+          : option.label;
+        if (option.quality === DEFAULT_QUALITY) element.selected = true;
+        qualitySelect.append(element);
+      }
+      qualitySelect.disabled = false;
+      submitButton.disabled = false;
+    }
+
+    function setQualityPlaceholder(text) {
+      qualitySelect.innerHTML = `<option>${text}</option>`;
+      qualitySelect.disabled = true;
+      submitButton.disabled = true;
+    }
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -42,24 +109,31 @@
         const created = await request("/api/downloads", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: urlInput.value }),
+          body: JSON.stringify({ url: urlInput.value, quality: qualitySelect.value }),
         });
-        poll(created.task_id);
+        watch(created.task_id);
       } catch (error) {
         showError(error.message);
       }
     });
 
-    async function poll(taskId) {
-      try {
-        const task = await request(`/api/downloads/${taskId}`);
+    function watch(taskId) {
+      const source = new EventSource(`/api/downloads/${taskId}/events`);
+
+      source.onmessage = (event) => {
+        const task = JSON.parse(event.data);
         render(task);
-        if (!TERMINAL.includes(task.status)) {
-          setTimeout(() => poll(taskId), POLL_INTERVAL_MS);
+        // Закрываем сами: иначе браузер увидит обрыв и начнёт переподключаться.
+        if (TERMINAL.includes(task.status)) source.close();
+      };
+
+      source.onerror = () => {
+        // Разрыв — не ошибка: браузер переподключится сам. Молчим, чтобы не
+        // затирать показанный прогресс.
+        if (source.readyState === EventSource.CLOSED) {
+          showError("соединение потеряно, обнови страницу");
         }
-      } catch (error) {
-        showError(error.message);
-      }
+      };
     }
 
     function render(task) {
@@ -67,18 +141,25 @@
         state.innerHTML = "";
         const link = document.createElement("a");
         link.href = task.download_url;
-        link.download = "";
+        if (!task.direct) link.download = "";
         link.textContent = `Скачать: ${task.title ?? "видео"}`;
         state.append(`Готово (${formatSize(task.file_size)}). `, link);
+        if (task.direct) {
+          const note = document.createElement("div");
+          note.className = "hint";
+          note.textContent = "Файл идёт напрямую с CDN, мимо сервера.";
+          state.append(note);
+        }
         return;
       }
 
       if (task.status === "failed") {
-        showError(`${task.error_code}: ${task.error_message ?? "без описания"}`);
+        showError(task.error_hint ?? task.error_code ?? "без описания");
         return;
       }
 
-      state.innerHTML = `<div>${task.status}: ${task.title ?? task.source_url}</div>`;
+      const label = STATUS_LABELS[task.status] ?? task.status;
+      state.innerHTML = `<div>${label}: ${task.title ?? ""}</div>`;
       const bar = document.createElement("progress");
       bar.max = 100;
       bar.value = task.progress;
@@ -89,13 +170,34 @@
       const response = await fetch(url, options);
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail ?? `HTTP ${response.status}`);
+        throw new Error(describeError(body) ?? `HTTP ${response.status}`);
       }
       return response.json();
     }
 
+    function describeError(body) {
+      const detail = body.detail;
+      if (!detail) return null;
+      if (typeof detail === "string") return detail;
+      // Отказ по квоте приходит без error_code, зато с готовым текстом.
+      if (detail.message) {
+        return detail.error_code ? `${detail.error_code}: ${detail.message}` : detail.message;
+      }
+      return JSON.stringify(detail);
+    }
+
     function formatSize(bytes) {
       return bytes ? `${(bytes / 1024 / 1024).toFixed(1)} МБ` : "размер неизвестен";
+    }
+
+    function formatDuration(seconds) {
+      if (!seconds) return "";
+      const total = Math.round(seconds);
+      const parts = [Math.floor(total / 3600), Math.floor(total / 60) % 60, total % 60];
+      return " · " + parts
+        .filter((value, index) => value > 0 || index > 0)
+        .map((value, index) => (index === 0 ? value : String(value).padStart(2, "0")))
+        .join(":");
     }
 
     function showError(message) {

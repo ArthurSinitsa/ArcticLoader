@@ -9,7 +9,7 @@ from arq.connections import RedisSettings
 from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging_setup import configure_logging
-from app.worker.tasks import download_task
+from app.worker.tasks import MAX_ATTEMPTS, download_task
 
 log = logging.getLogger(__name__)
 
@@ -50,5 +50,6 @@ class WorkerSettings:
 
     job_timeout = _settings.download_timeout_seconds + 60
 
-    #: Ретраи с backoff — Этап 2. Сейчас упавшая задача остаётся `failed`.
-    max_tries = 1
+    #: Повторяет только то, что воркер сам просит через `Retry` — сетевые сбои
+    #: и таймауты. Остальные ошибки сразу терминальны, см. RETRYABLE_ERRORS.
+    max_tries = MAX_ATTEMPTS

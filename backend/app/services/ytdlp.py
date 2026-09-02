@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app.services import storage
@@ -33,6 +33,12 @@ _PROGRESS_TEMPLATE = (
     "%(progress.status)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s"
     "|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.eta)s"
 )
+#: Ремукс идёт без единого события прогресса, поэтому о его начале узнаём
+#: отдельно: иначе полоска молча стоит на последних процентах, пока работает
+#: ffmpeg, и выглядит это как зависание.
+POST_PREFIX = "#ARCTIC_POST#"
+_POSTPROCESS_TEMPLATE = f"postprocess:{POST_PREFIX}%(progress.status)s|%(progress.postprocessor)s"
+
 _FILEPATH_TEMPLATE = f"after_move:{FILE_PREFIX}%(filepath)s"
 _OUTPUT_TEMPLATE = "%(title).150B.%(ext)s"
 
@@ -42,6 +48,13 @@ _MISSING_VALUES = frozenset({"", "NA", "None", "none"})
 
 ERROR_UNKNOWN = "unknown"
 ERROR_TIMEOUT = "timeout"
+
+#: Так yt-dlp помечает отсутствующую дорожку в формате.
+NO_CODEC = "none"
+
+#: Протоколы, ссылку на которые можно отдать браузеру как есть. HLS и DASH
+#: сюда не входят: манифест сам по себе не файл.
+DIRECT_PROTOCOLS = frozenset({"http", "https"})
 
 #: Классификация ошибок из раздела 3.4 плана: реакция на них разная, поэтому
 #: сваливать всё в «не получилось» нельзя. Порядок значим — первое совпадение
@@ -72,6 +85,8 @@ ERROR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "login_required",
     ),
+    # 404 и 410 — не сетевой сбой: повторять их бессмысленно, ссылки просто нет.
+    (re.compile(r"http error 40[49]|not found|no longer available", re.I), "not_found"),
     (
         re.compile(
             r"unable to download|connection|timed out|name resolution|http error \d{3}",
@@ -80,6 +95,30 @@ ERROR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "network",
     ),
 )
+
+#: Повторять имеет смысл только то, что чинится само. Раздел 3.4: при
+#: geo_blocked и login_required ретрай бесполезен, а rate_limited — сигнал о
+#: проблемах с IP, и долбить площадку в этот момент только хуже.
+RETRYABLE_ERRORS = frozenset({"network", ERROR_TIMEOUT})
+
+#: Тексты для пользователя: «не получилось» — это не сообщение об ошибке.
+USER_MESSAGES: dict[str, str] = {
+    "unsupported_site": "Не удалось распознать видео на этой странице.",
+    "not_found": "Видео не найдено: ссылка битая или запись удалена.",
+    "login_required": "Видео закрыто — нужен вход или подписка.",
+    "geo_blocked": "Видео недоступно в этой стране.",
+    "rate_limited": "Площадка временно ограничила доступ. Попробуй позже.",
+    "network": "Сеть подвела, связаться с площадкой не вышло.",
+    "disk_full": "На сервере закончилось место.",
+    ERROR_TIMEOUT: "Загрузка не уложилась в отведённое время.",
+    ERROR_UNKNOWN: "Скачать не удалось, подробности — в журнале сервера.",
+}
+
+
+def user_message(error_code: str | None) -> str | None:
+    if error_code is None:
+        return None
+    return USER_MESSAGES.get(error_code, USER_MESSAGES[ERROR_UNKNOWN])
 
 
 class YtDlpError(RuntimeError):
@@ -91,11 +130,62 @@ class YtDlpError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class MediaFormat:
+    """Один вариант из списка форматов yt-dlp."""
+
+    format_id: str
+    ext: str
+    height: int | None = None
+    vcodec: str | None = None
+    acodec: str | None = None
+    filesize: int | None = None
+    protocol: str | None = None
+    #: Прямая ссылка на CDN. В кэш не попадает: живёт часы и весит килобайты.
+    url: str | None = None
+
+    @property
+    def has_video(self) -> bool:
+        return bool(self.vcodec) and self.vcodec != NO_CODEC
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.acodec) and self.acodec != NO_CODEC
+
+    @property
+    def is_unlabelled(self) -> bool:
+        """Формат без разметки дорожек.
+
+        Так generic-экстрактор отдаёт одиночный файл: ни высоты, ни кодеков,
+        ни размера. Это и есть «неизвестный вебинар» — полноценное видео,
+        про которое площадка ничего не сообщила.
+        """
+        return self.vcodec is None and self.acodec is None
+
+    @property
+    def is_progressive(self) -> bool:
+        """Видео и звук уже в одном контейнере — ремукс не нужен (раздел 1.5)."""
+        return self.is_unlabelled or (self.has_video and self.has_audio)
+
+    @property
+    def is_direct_http(self) -> bool:
+        """Ссылку можно отдать браузеру: это файл, а не манифест."""
+        return self.protocol in DIRECT_PROTOCOLS
+
+
+@dataclass(frozen=True, slots=True)
 class MediaInfo:
     title: str
     extractor: str
     duration: float | None = None
     filesize_approx: int | None = None
+    formats: tuple[MediaFormat, ...] = ()
+
+    def without_urls(self) -> MediaInfo:
+        """Копия без ссылок на CDN — то, что можно класть в кэш."""
+        return replace(
+            self,
+            formats=tuple(replace(fmt, url=None) for fmt in self.formats),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +203,21 @@ class Progress:
         return min(100.0, self.downloaded_bytes / self.total_bytes * 100)
 
 
+@dataclass(frozen=True, slots=True)
+class PostProcess:
+    status: str
+    processor: str
+
+    @property
+    def is_merge_started(self) -> bool:
+        return self.status == "started" and self.processor == MERGER
+
+
+#: Имя постпроцессора, который сшивает раздельные дорожки DASH.
+MERGER = "Merger"
+
 ProgressCallback = Callable[[Progress], Awaitable[None]]
+PostProcessCallback = Callable[[PostProcess], Awaitable[None]]
 StartCallback = Callable[[int], Awaitable[None]]
 
 
@@ -145,6 +249,18 @@ def parse_progress_line(line: str) -> Progress | None:
     )
 
 
+def parse_postprocess_line(line: str) -> PostProcess | None:
+    if not line.startswith(POST_PREFIX):
+        return None
+
+    fields = line[len(POST_PREFIX) :].split("|")
+    if len(fields) != 2:
+        log.debug("не разобрана строка постобработки: %r", line)
+        return None
+
+    return PostProcess(status=fields[0], processor=fields[1])
+
+
 async def probe(url: str, *, timeout: float) -> MediaInfo:
     """Метаданные без скачивания: `yt-dlp -J`."""
     stdout, stderr, code = await _run(
@@ -163,17 +279,42 @@ async def probe(url: str, *, timeout: float) -> MediaInfo:
         extractor=info.get("extractor_key") or info.get("extractor") or "generic",
         duration=info.get("duration"),
         filesize_approx=info.get("filesize_approx"),
+        formats=tuple(_parse_format(raw) for raw in info.get("formats") or ()),
     )
+
+
+def _parse_format(raw: dict[str, object]) -> MediaFormat:
+    return MediaFormat(
+        format_id=str(raw.get("format_id") or ""),
+        ext=str(raw.get("ext") or ""),
+        height=_coerce_int(raw.get("height")),
+        vcodec=_coerce_str(raw.get("vcodec")),
+        acodec=_coerce_str(raw.get("acodec")),
+        # filesize известен не всегда: у DASH-фрагментов есть только оценка.
+        filesize=_coerce_int(raw.get("filesize") or raw.get("filesize_approx")),
+        protocol=_coerce_str(raw.get("protocol")),
+        url=_coerce_str(raw.get("url")),
+    )
+
+
+def _coerce_int(value: object) -> int | None:
+    return int(value) if isinstance(value, int | float) else None
+
+
+def _coerce_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 async def download(
     url: str,
     *,
     format_spec: str,
+    format_sort: str,
     dest_dir: Path,
     timeout: float,
     on_start: StartCallback | None = None,
     on_progress: ProgressCallback | None = None,
+    on_postprocess: PostProcessCallback | None = None,
 ) -> Path:
     """Качает файл в `dest_dir` и возвращает путь к результату."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -187,12 +328,16 @@ async def download(
         "--restrict-filenames",
         "--progress-template",
         _PROGRESS_TEMPLATE,
+        "--progress-template",
+        _POSTPROCESS_TEMPLATE,
         "--print",
         _FILEPATH_TEMPLATE,
         "--merge-output-format",
         "mp4",
         "-f",
         format_spec,
+        "--format-sort",
+        format_sort,
         "-o",
         str(dest_dir / _OUTPUT_TEMPLATE),
         url,
@@ -209,7 +354,7 @@ async def download(
     try:
         async with asyncio.timeout(timeout):
             _, stderr_bytes, code = await asyncio.gather(
-                _consume_stdout(process, printed_paths, on_progress),
+                _consume_stdout(process, printed_paths, on_progress, on_postprocess),
                 process.stderr.read(),
                 process.wait(),
             )
@@ -246,6 +391,7 @@ async def _consume_stdout(
     process: asyncio.subprocess.Process,
     printed_paths: list[str],
     on_progress: ProgressCallback | None,
+    on_postprocess: PostProcessCallback | None,
 ) -> None:
     async for raw_line in process.stdout:
         line = raw_line.decode(errors="replace").strip()
@@ -253,6 +399,8 @@ async def _consume_stdout(
             printed_paths.append(line[len(FILE_PREFIX) :])
         elif on_progress is not None and (progress := parse_progress_line(line)):
             await on_progress(progress)
+        elif on_postprocess is not None and (stage := parse_postprocess_line(line)):
+            await on_postprocess(stage)
 
 
 def _resolve_output(dest_dir: Path, printed_paths: list[str]) -> Path:

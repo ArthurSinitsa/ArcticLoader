@@ -2,6 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models import TaskStatus
 from app.services import tasks as tasks_repo
+from app.services.formats import Quality
 
 
 async def test_create_task_starts_queued(
@@ -9,7 +10,7 @@ async def test_create_task_starts_queued(
 ) -> None:
     async with session_factory() as session:
         task = await tasks_repo.create_task(
-            session, source_url="https://example.com/v", format_id=None
+            session, source_url="https://example.com/v", quality=Quality.P1080
         )
 
     assert task.status is TaskStatus.QUEUED
@@ -22,7 +23,7 @@ async def test_update_task_writes_fields(
 ) -> None:
     async with session_factory() as session:
         task = await tasks_repo.create_task(
-            session, source_url="https://example.com/v", format_id=None
+            session, source_url="https://example.com/v", quality=Quality.P1080
         )
         await tasks_repo.update_task(session, task.id, progress=42.5, worker_pid=777)
         stored = await tasks_repo.get_task(session, task.id)
@@ -37,7 +38,7 @@ async def test_set_status_does_not_revive_terminal_task(
     """Отменённая задача не должна воскреснуть от догоняющего апдейта воркера."""
     async with session_factory() as session:
         task = await tasks_repo.create_task(
-            session, source_url="https://example.com/v", format_id=None
+            session, source_url="https://example.com/v", quality=Quality.P1080
         )
         await tasks_repo.set_status(session, task.id, TaskStatus.CANCELLED)
 
@@ -53,7 +54,7 @@ async def test_set_status_reports_success_for_live_task(
 ) -> None:
     async with session_factory() as session:
         task = await tasks_repo.create_task(
-            session, source_url="https://example.com/v", format_id=None
+            session, source_url="https://example.com/v", quality=Quality.P1080
         )
 
         applied = await tasks_repo.set_status(

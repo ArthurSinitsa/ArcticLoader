@@ -5,5 +5,7 @@ sqlalchemy[asyncio]==2.0.52
 asyncpg==0.31.0
 alembic==1.19.1
 arq==0.28.0
+# Хеш паролей: argon2id — умолчания библиотеки, без своей крипты.
+argon2-cffi==25.1.0
 
 yt-dlp==2026.8.19

@@ -6,7 +6,18 @@
 # На сервере адрес меняется на `video.example.com:8443` с блоком tls/dns —
 # сертификат выпускается через DNS-01, потому что 80 и 443 заняты (раздел 4.3).
 :8080 {
-	encode zstd gzip
+	# Список типов задан явно: text/* по умолчанию затягивает и
+	# text/event-stream, а сжатый SSE копится в буфере вместо того, чтобы идти
+	# в браузер по событию.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/plain*
+			header Content-Type application/json*
+			header Content-Type application/javascript*
+		}
+	}
 
 	# Готовые файлы уходят с диска мимо приложения — раздел 6 плана.
 	handle_path /files/* {
@@ -16,7 +27,10 @@
 
 	@app path /api/* /healthz /docs /docs/* /openapi.json
 	handle @app {
-		reverse_proxy api:8000
+		reverse_proxy api:8000 {
+			# Без этого прокси копит ответ и SSE приезжает пачкой в конце.
+			flush_interval -1
+		}
 	}
 
 	handle {
