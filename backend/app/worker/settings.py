@@ -5,10 +5,12 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 from arq.connections import RedisSettings
+from arq.cron import cron
 
 from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging_setup import configure_logging
+from app.worker.cleanup import cleanup_task
 from app.worker.tasks import MAX_ATTEMPTS, download_task
 
 log = logging.getLogger(__name__)
@@ -26,9 +28,10 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["settings"] = _settings
 
     log.info(
-        "воркер запущен: одновременных загрузок %s, каталог %s",
+        "воркер запущен: одновременных загрузок %s, каталог %s, файлы живут %s ч",
         _settings.max_concurrent_downloads,
         _settings.media_root,
+        _settings.file_ttl_hours,
     )
 
 
@@ -39,6 +42,18 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 class WorkerSettings:
     functions: ClassVar[list[Callable[..., Any]]] = [download_task]
+
+    #: Чистка живёт здесь же, отдельной cron-функцией: поднимать ради неё
+    #: системный cron и второй контейнер незачем (раздел 3).
+    cron_jobs: ClassVar[list[Any]] = [
+        cron(
+            cleanup_task,
+            minute={
+                minute for minute in range(60) if minute % _settings.cleanup_interval_minutes == 0
+            },
+            run_at_startup=True,
+        )
+    ]
     on_startup = startup
     on_shutdown = shutdown
 

@@ -91,3 +91,16 @@ async def purge_expired(session: AsyncSession, *, ttl_seconds: int) -> int:
     result = await session.execute(sa.delete(UrlMeta).where(UrlMeta.fetched_at < deadline))
     await session.commit()
     return result.rowcount
+
+
+async def purge_stale(session: AsyncSession, *, ttl_seconds: int, now: datetime) -> int:
+    """Выбросить записи старше TTL.
+
+    Кэш и так проверяет срок при чтении, но без чистки таблица растёт вечно:
+    каждая ссылка, которую кто-то однажды вставил, остаётся в ней навсегда.
+    """
+    result = await session.execute(
+        sa.delete(UrlMeta).where(UrlMeta.fetched_at < now - timedelta(seconds=ttl_seconds))
+    )
+    await session.commit()
+    return result.rowcount

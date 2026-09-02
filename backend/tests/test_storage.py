@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -58,3 +59,29 @@ def test_public_url_percent_encodes_names(tmp_path: Path) -> None:
     assert url.startswith("http://host:8080/files/task-1/")
     assert " " not in url
     assert unquote(url).endswith("task-1/моё видео.mp4")
+
+
+def test_free_space_is_reported(tmp_path: Path) -> None:
+    assert storage.free_space(tmp_path) > 0
+
+
+def test_free_space_survives_missing_directory(tmp_path: Path) -> None:
+    """Каталог загрузок может ещё не существовать — проверка места не должна
+    падать раньше, чем воркер успеет его создать."""
+    assert storage.free_space(tmp_path / "нет" / "такого") > 0
+
+
+def test_task_directory_is_removed(tmp_path: Path) -> None:
+    task_id = uuid.uuid4()
+    directory = storage.task_dir(tmp_path, task_id)
+    directory.mkdir(parents=True)
+    (directory / "video.mp4").write_bytes(b"data")
+
+    storage.remove_task_dir(tmp_path, task_id)
+
+    assert not directory.exists()
+
+
+def test_removing_absent_directory_is_not_an_error(tmp_path: Path) -> None:
+    """Файл могли удалить руками — чистка не должна на этом спотыкаться."""
+    storage.remove_task_dir(tmp_path, uuid.uuid4())

@@ -5,6 +5,7 @@
 """
 
 import re
+import shutil
 import uuid
 from pathlib import Path
 from urllib.parse import quote
@@ -45,3 +46,22 @@ def public_url(base_url: str, media_root: Path, file_path: Path) -> str:
     """Ссылка, по которой файл отдаёт Caddy — приложение в передаче не участвует."""
     relative = file_path.relative_to(media_root)
     return f"{base_url.rstrip('/')}/{quote(relative.as_posix())}"
+
+
+def free_space(path: Path) -> int:
+    """Свободно байт на томе с загрузками — раздел 3 плана.
+
+    Каталога может ещё не быть (первый запуск, том только смонтировали),
+    поэтому поднимаемся к ближайшему существующему предку: место всё равно
+    считается по тому целиком.
+    """
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return shutil.disk_usage(probe).free
+
+
+def remove_task_dir(media_root: Path, task_id: uuid.UUID | str) -> None:
+    """Удалить файлы задачи. Отсутствие каталога — норма: файл могли снести
+    руками, а чистка не должна на этом спотыкаться."""
+    shutil.rmtree(task_dir(media_root, task_id), ignore_errors=True)

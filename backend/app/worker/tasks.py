@@ -3,7 +3,7 @@
 import logging
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +30,10 @@ MAX_DOWNLOAD_PERCENT = 99.0
 
 MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY_SECONDS = 15
+
+#: Пауза, пока чистка освобождает место. Пять минут: чаще дёргать диск
+#: бессмысленно, реже — задача простаивает.
+DISK_RETRY_DELAY_SECONDS = 300
 
 
 class _TaskFinishedError(Exception):
@@ -84,6 +88,8 @@ class _Job:
             quality.value,
         )
 
+        self._require_free_space()
+
         try:
             info = await self._extract(task)
 
@@ -107,6 +113,27 @@ class _Job:
             return
 
         await self._finish_file(file_path)
+
+    def _deadline(self) -> datetime:
+        return _now() + timedelta(hours=self._settings.file_ttl_hours)
+
+    def _require_free_space(self) -> None:
+        """Не начинать загрузку на переполненном диске — раздел 3.
+
+        Начатая всё равно не доедет: место нужно и файлу, и ремуксу, которому
+        на время работы требуется второй такой же. Задача остаётся в очереди
+        и ждёт, пока чистка освободит место.
+        """
+        free = storage.free_space(self._settings.media_root)
+        if free >= self._settings.min_free_disk_bytes:
+            return
+
+        log.error(
+            "мало места на диске: свободно %.1f ГБ при пороге %.1f ГБ — очередь ждёт",
+            free / 1024**3,
+            self._settings.min_free_disk_bytes / 1024**3,
+        )
+        raise Retry(defer=DISK_RETRY_DELAY_SECONDS)
 
     async def _extract(self, task: Task) -> ytdlp.MediaInfo:
         await self._advance(TaskStatus.EXTRACTING)
@@ -163,6 +190,9 @@ class _Job:
             format_id=chosen.format_id,
             worker_pid=None,
             finished_at=_now(),
+            # Файла на сервере нет, но ссылка на CDN живёт часы — задача
+            # тоже обязана однажды перестать притворяться готовой.
+            expires_at=self._deadline(),
         )
         log.info(
             "готово без участия сервера: формат %s, %sp — клиент качает с CDN",
@@ -179,6 +209,7 @@ class _Job:
             file_size=size,
             worker_pid=None,
             finished_at=_now(),
+            expires_at=self._deadline(),
         )
         log.info("готово: %s, %.1f МБ", file_path.name, size / 1024 / 1024)
 

@@ -17,6 +17,10 @@
     .hidden { display: none; }
     .account { display: flex; gap: .5rem; align-items: center; margin-bottom: 1rem; }
     #login-form input, #password-form input { flex: 1; }
+    #history { margin-top: 2rem; }
+    #history h2 { font-size: 1rem; }
+    #history-list { list-style: none; padding: 0; }
+    #history-list li { padding: .4rem 0; border-bottom: 1px solid #eee; font-size: .9rem; }
   </style>
 </head>
 <body>
@@ -64,6 +68,11 @@
   <div id="title" class="hint"></div>
   <div id="state"></div>
 
+  <section id="history" class="hidden">
+    <h2>История</h2>
+    <ul id="history-list"></ul>
+  </section>
+
   <script>
     // Временная страница: прогресс приходит по SSE. На Этапе 7 — React + PWA.
     const TERMINAL = ["ready", "failed", "cancelled", "expired"];
@@ -91,6 +100,8 @@
     const signOutButton = document.getElementById("signout");
     const loginForm = document.getElementById("login-form");
     const passwordForm = document.getElementById("password-form");
+    const historyBox = document.getElementById("history");
+    const historyList = document.getElementById("history-list");
 
     // Гость тоже качает (раздел 2.5.1), поэтому вход — не преграда, а кнопка:
     // авторизованному просто положены лимиты повыше.
@@ -150,6 +161,41 @@
       // С временным паролем ничего, кроме его смены, всё равно не работает.
       toggle(passwordForm, Boolean(user && user.must_change_password));
       toggle(form, !user || !user.must_change_password);
+
+      // История есть только у авторизованных — матрица 2.5.1.
+      toggle(historyBox, Boolean(user && !user.must_change_password));
+      if (user && !user.must_change_password) loadHistory();
+    }
+
+    async function loadHistory() {
+      const response = await fetch("/api/downloads?limit=10");
+      if (!response.ok) return;
+      const { items } = await response.json();
+
+      historyList.replaceChildren(...items.map(describeHistoryItem));
+      if (!items.length) {
+        const empty = document.createElement("li");
+        empty.className = "hint";
+        empty.textContent = "Пока пусто";
+        historyList.append(empty);
+      }
+    }
+
+    function describeHistoryItem(task) {
+      const item = document.createElement("li");
+      const name = task.title ?? task.source_url;
+
+      if (task.status === "ready" && task.download_url) {
+        const link = document.createElement("a");
+        link.href = task.download_url;
+        link.textContent = name;
+        item.append(link, ` · ${formatSize(task.file_size)}`);
+      } else {
+        // `expired` — не поломка: файл просто прожил свои двое суток.
+        const label = task.status === "expired" ? "срок вышел" : STATUS_LABELS[task.status] ?? task.status;
+        item.append(`${name} · ${label}`);
+      }
+      return item;
     }
 
     function toggle(element, visible) {
@@ -225,7 +271,11 @@
         const task = JSON.parse(event.data);
         render(task);
         // Закрываем сами: иначе браузер увидит обрыв и начнёт переподключаться.
-        if (TERMINAL.includes(task.status)) source.close();
+        if (TERMINAL.includes(task.status)) {
+          source.close();
+          // Свежая загрузка должна появиться в истории сразу, а не после F5.
+          if (!historyBox.classList.contains("hidden")) loadHistory();
+        }
       };
 
       source.onerror = () => {

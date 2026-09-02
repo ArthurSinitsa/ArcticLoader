@@ -87,3 +87,27 @@ async def count_active(
         .select_from(Task)
         .where(owner, Task.status.not_in(TERMINAL_STATUSES))
     )
+
+
+async def list_for_user(
+    session: AsyncSession, user_id: uuid.UUID, *, limit: int, offset: int
+) -> tuple[list[Task], int]:
+    """Страница истории и общее число загрузок пользователя.
+
+    Общее число считается отдельным запросом: без него UI не знает, есть ли
+    следующая страница, а тянуть всю таблицу ради подсчёта незачем.
+    """
+    rows = (
+        await session.scalars(
+            sa.select(Task)
+            .where(Task.user_id == user_id)
+            .order_by(Task.created_at.desc(), Task.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+
+    total = await session.scalar(
+        sa.select(sa.func.count()).select_from(Task).where(Task.user_id == user_id)
+    )
+    return list(rows), total

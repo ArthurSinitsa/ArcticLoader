@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -382,3 +383,76 @@ def _failing_probe(error: Exception) -> Any:
         raise error
 
     return probe
+
+
+async def test_ready_file_gets_a_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: dict[str, Any],
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Без срока файл лежит на диске вечно — раздел 3."""
+    task_id = await make_task(session_factory)
+    stub_probe(monkeypatch)
+    stub_download(monkeypatch)
+
+    await worker.download_task(ctx, str(task_id))
+
+    stored = await fetch_task(session_factory, task_id)
+    # SQLite в тестах хранит время без зоны, Postgres — с ней.
+    deadline = stored.expires_at.replace(tzinfo=stored.expires_at.tzinfo or UTC)
+    expected = datetime.now(UTC) + timedelta(hours=settings.file_ttl_hours)
+    assert abs((deadline - expected).total_seconds()) < 60
+
+
+async def test_direct_link_gets_a_deadline_too(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: dict[str, Any],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Файла на сервере нет, но ссылка на CDN живёт часы и тоже протухает."""
+    task_id = await make_task(session_factory, quality=Quality.P360)
+    stub_probe(monkeypatch, media_formats=PROGRESSIVE_FORMATS)
+
+    await worker.download_task(ctx, str(task_id))
+
+    stored = await fetch_task(session_factory, task_id)
+    assert stored.direct_url is not None
+    assert stored.expires_at is not None
+
+
+async def test_download_waits_when_disk_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: dict[str, Any],
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Начатая на переполненном диске загрузка не доедет до конца — раздел 3."""
+    settings.min_free_disk_bytes = 10**18
+    task_id = await make_task(session_factory)
+    stub_probe(monkeypatch)
+    stub_download(monkeypatch)
+
+    with pytest.raises(Retry):
+        await worker.download_task(ctx, str(task_id))
+
+    stored = await fetch_task(session_factory, task_id)
+    # Задача обязана остаться в очереди: иначе повтор увидит чужой статус.
+    assert stored.status is TaskStatus.QUEUED
+
+
+async def test_full_disk_does_not_start_yt_dlp(
+    monkeypatch: pytest.MonkeyPatch,
+    ctx: dict[str, Any],
+    settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings.min_free_disk_bytes = 10**18
+    task_id = await make_task(session_factory)
+    stub_probe(monkeypatch)
+    calls = stub_download(monkeypatch)
+
+    with pytest.raises(Retry):
+        await worker.download_task(ctx, str(task_id))
+
+    assert calls == []

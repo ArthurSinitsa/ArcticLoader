@@ -83,3 +83,10 @@ class CurrentUser(BaseModel):
     name: str
     must_change_password: bool
     role: str
+
+
+class DownloadHistory(BaseModel):
+    items: list[DownloadState]
+    #: Всего загрузок у пользователя, а не на странице: иначе UI не покажет,
+    #: что дальше есть ещё.
+    total: int
