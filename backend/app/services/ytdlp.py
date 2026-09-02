@@ -218,7 +218,9 @@ MERGER = "Merger"
 
 ProgressCallback = Callable[[Progress], Awaitable[None]]
 PostProcessCallback = Callable[[PostProcess], Awaitable[None]]
-StartCallback = Callable[[int], Awaitable[None]]
+#: Получает сам процесс, а не только PID: по номеру из другого контейнера
+#: сигнал не отправить, а прерывание задач держится на этом (раздел 2.5.3).
+StartCallback = Callable[["asyncio.subprocess.Process"], Awaitable[None]]
 
 
 def classify_error(stderr: str) -> str:
@@ -348,7 +350,7 @@ async def download(
     )
     log.info("yt-dlp запущен, pid=%s, формат=%s", process.pid, format_spec)
     if on_start is not None:
-        await on_start(process.pid)
+        await on_start(process)
 
     printed_paths: list[str] = []
     try:
@@ -371,7 +373,9 @@ async def download(
     return _resolve_output(dest_dir, printed_paths)
 
 
-async def terminate_process(process: asyncio.subprocess.Process) -> None:
+async def terminate_process(
+    process: asyncio.subprocess.Process, *, grace: float | None = None
+) -> None:
     """Мягкая остановка по процедуре из раздела 2.5.3: SIGTERM, затем SIGKILL."""
     if process.returncode is not None:
         return
@@ -379,7 +383,7 @@ async def terminate_process(process: asyncio.subprocess.Process) -> None:
     log.info("останавливаю процесс %s", process.pid)
     process.terminate()
     try:
-        async with asyncio.timeout(TERMINATE_GRACE_SECONDS):
+        async with asyncio.timeout(grace if grace is not None else TERMINATE_GRACE_SECONDS):
             await process.wait()
     except TimeoutError:
         log.warning("процесс %s не ответил на SIGTERM, отправляю SIGKILL", process.pid)

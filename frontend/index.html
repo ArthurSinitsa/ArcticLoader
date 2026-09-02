@@ -21,6 +21,12 @@
     #history h2 { font-size: 1rem; }
     #history-list { list-style: none; padding: 0; }
     #history-list li { padding: .4rem 0; border-bottom: 1px solid #eee; font-size: .9rem; }
+    #admin { margin-top: 2rem; border-top: 2px solid #ddd; padding-top: 1rem; }
+    #admin h3 { font-size: .95rem; margin: 1rem 0 .3rem; }
+    #admin ul { list-style: none; padding: 0; }
+    #admin li { padding: .35rem 0; border-bottom: 1px solid #eee; font-size: .875rem;
+                display: flex; gap: .5rem; align-items: center; justify-content: space-between; }
+    #admin button { font-size: .8rem; }
   </style>
 </head>
 <body>
@@ -73,6 +79,34 @@
     <ul id="history-list"></ul>
   </section>
 
+  <section id="admin" class="hidden">
+    <h2>Администрирование</h2>
+
+    <h3>Сейчас качается</h3>
+    <ul id="admin-tasks"></ul>
+
+    <h3>Пользователи</h3>
+    <form id="admin-search" class="row">
+      <input id="admin-query" type="search" placeholder="Поиск по email или имени">
+      <button type="submit">Найти</button>
+    </form>
+    <ul id="admin-users"></ul>
+
+    <form id="admin-create" class="row">
+      <input id="new-email" type="email" placeholder="Email новой учётки" required>
+      <input id="new-name" type="text" placeholder="Имя" required>
+      <button type="submit">Завести</button>
+    </form>
+
+    <section id="admin-super" class="hidden">
+      <h3>Рубильники</h3>
+      <ul id="admin-flags"></ul>
+
+      <h3>Журнал</h3>
+      <ul id="admin-audit"></ul>
+    </section>
+  </section>
+
   <script>
     // Временная страница: прогресс приходит по SSE. На Этапе 7 — React + PWA.
     const TERMINAL = ["ready", "failed", "cancelled", "expired"];
@@ -102,6 +136,37 @@
     const passwordForm = document.getElementById("password-form");
     const historyBox = document.getElementById("history");
     const historyList = document.getElementById("history-list");
+    const adminBox = document.getElementById("admin");
+    const adminSuper = document.getElementById("admin-super");
+    const adminTasks = document.getElementById("admin-tasks");
+    const adminUsers = document.getElementById("admin-users");
+    const adminFlags = document.getElementById("admin-flags");
+    const adminAudit = document.getElementById("admin-audit");
+
+    document.getElementById("admin-search").addEventListener("submit", (event) => {
+      event.preventDefault();
+      loadAdminUsers().catch((error) => showError(error.message));
+    });
+
+    document.getElementById("admin-create").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      try {
+        const created = await request("/api/admin/users", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: document.getElementById("new-email").value,
+            name: document.getElementById("new-name").value,
+          }),
+        });
+        // Пароль показывается ровно один раз — дальше в базе только хеш.
+        alert(`Временный пароль для ${created.user.email}: ${created.temporary_password}`);
+        event.target.reset();
+        loadAdminUsers();
+      } catch (error) {
+        showError(error.message);
+      }
+    });
 
     // Гость тоже качает (раздел 2.5.1), поэтому вход — не преграда, а кнопка:
     // авторизованному просто положены лимиты повыше.
@@ -163,8 +228,111 @@
       toggle(form, !user || !user.must_change_password);
 
       // История есть только у авторизованных — матрица 2.5.1.
-      toggle(historyBox, Boolean(user && !user.must_change_password));
-      if (user && !user.must_change_password) loadHistory();
+      const working = Boolean(user && !user.must_change_password);
+      toggle(historyBox, working);
+      if (working) loadHistory();
+
+      // Раздел администрирования просто не существует для тех, кому не положен.
+      const isAdmin = working && ["admin", "superadmin"].includes(user.role);
+      toggle(adminBox, isAdmin);
+      toggle(adminSuper, working && user.role === "superadmin");
+      if (isAdmin) loadAdmin(user.role);
+    }
+
+    async function loadAdmin(role) {
+      await Promise.all([loadAdminTasks(), loadAdminUsers()]);
+      // Рубильники и журнал — за суперадмином (разделы 2.5.1 и 3.6).
+      if (role === "superadmin") await Promise.all([loadFlags(), loadAudit()]);
+    }
+
+    async function loadAdminTasks() {
+      const { items } = await request("/api/admin/tasks");
+      adminTasks.replaceChildren(...items.map((task) => {
+        const row = document.createElement("li");
+        const owner = task.owner ?? "гость";
+        row.append(`${(task.title ?? task.source_url).slice(0, 50)} · ${owner} · ` +
+                   `${STATUS_LABELS[task.status] ?? task.status} ${task.progress.toFixed(0)}%`);
+        row.append(button("Прервать", async () => {
+          await request(`/api/downloads/${task.id}/cancel`, { method: "POST" }, true);
+          loadAdminTasks();
+        }));
+        return row;
+      }));
+      if (!items.length) adminTasks.replaceChildren(hint("Тихо"));
+    }
+
+    async function loadAdminUsers() {
+      const query = document.getElementById("admin-query").value.trim();
+      const { items } = await request(`/api/admin/users?limit=20&search=${encodeURIComponent(query)}`);
+
+      adminUsers.replaceChildren(...items.map((user) => {
+        const row = document.createElement("li");
+        const state = user.is_active ? "" : " · выключен";
+        row.append(`${user.email} · ${user.role}${state}`);
+        row.append(button(user.is_active ? "Выключить" : "Включить", async () => {
+          await request(`/api/admin/users/${user.id}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ is_active: !user.is_active }),
+          });
+          loadAdminUsers();
+        }));
+        row.append(button("Удалить", async () => {
+          if (!confirm(`Удалить ${user.email}?`)) return;
+          await request(`/api/admin/users/${user.id}`, { method: "DELETE" }, true);
+          loadAdminUsers();
+        }));
+        return row;
+      }));
+    }
+
+    async function loadFlags() {
+      const state = await request("/api/admin/flags");
+      adminFlags.replaceChildren(...Object.entries(state).map(([key, enabled]) => {
+        const row = document.createElement("li");
+        row.append(`${key}: ${enabled ? "включено" : "выключено"}`);
+        row.append(button(enabled ? "Выключить" : "Включить", async () => {
+          await request(`/api/admin/flags/${key}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: !enabled }),
+          });
+          loadFlags();
+        }));
+        return row;
+      }));
+    }
+
+    async function loadAudit() {
+      const { items } = await request("/api/admin/audit?limit=15");
+      adminAudit.replaceChildren(...items.map((entry) => {
+        const row = document.createElement("li");
+        const when = new Date(entry.created_at).toLocaleString("ru");
+        row.append(`${when} · ${entry.action} · ${entry.target_type}:${entry.target_id ?? "—"}`);
+        return row;
+      }));
+      if (!items.length) adminAudit.replaceChildren(hint("Пусто"));
+    }
+
+    function button(label, handler) {
+      const element = document.createElement("button");
+      element.type = "button";
+      element.textContent = label;
+      element.addEventListener("click", async () => {
+        try {
+          await handler();
+        } catch (error) {
+          showError(error.message);
+        }
+      });
+      return element;
+    }
+
+    function hint(text) {
+      const row = document.createElement("li");
+      row.className = "hint";
+      row.textContent = text;
+      return row;
     }
 
     async function loadHistory() {

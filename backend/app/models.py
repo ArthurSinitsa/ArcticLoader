@@ -156,6 +156,59 @@ class Task(Base):
         return f"<Task {self.id} {self.status} {self.source_url!r}>"
 
 
+class AuditEntry(Base):
+    """Журнал административных действий — раздел 3.6.
+
+    Кто, что, над кем, когда и с какого адреса. Не бюрократия: когда учётка
+    или чужая задача исчезнет, объяснить произошедшее больше нечем.
+    """
+
+    __tablename__ = "audit_log"
+
+    #: Порядковый номер, а не UUID: журнал — лента, и читается она по порядку.
+    #: Случайный идентификатор не даёт устойчивой сортировки для записей,
+    #: сделанных в одну и ту же секунду.
+    id: Mapped[int] = mapped_column(
+        sa.BigInteger().with_variant(sa.Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
+    #: Пусто, если действие совершил сам сервис, а не человек.
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    action: Mapped[str] = mapped_column(sa.String(64), index=True)
+    target_type: Mapped[str] = mapped_column(sa.String(32))
+    target_id: Mapped[str | None] = mapped_column(sa.String(64), index=True)
+    #: Подробности действия: что именно изменилось и на что.
+    payload: Mapped[dict | None] = mapped_column(sa.JSON)
+    ip: Mapped[str | None] = mapped_column(sa.String(45))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<AuditEntry {self.action} {self.target_type}:{self.target_id}>"
+
+
+class RuntimeFlag(Base):
+    """Глобальный рубильник — раздел 3.6.
+
+    В БД, а не в `.env`: волна ботов лечится галочкой, а не перезапуском
+    контейнера ночью. Строки заводятся по мере переключения, отсутствие
+    записи означает значение по умолчанию.
+    """
+
+    __tablename__ = "runtime_flags"
+
+    key: Mapped[str] = mapped_column(sa.String(32), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(sa.Boolean)
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now()
+    )
+
+    def __repr__(self) -> str:
+        return f"<RuntimeFlag {self.key}={self.enabled}>"
+
+
 class UrlMeta(Base):
     """Кэш метаданных ссылки — раздел 3.1.
 

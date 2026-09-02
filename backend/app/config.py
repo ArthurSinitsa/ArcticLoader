@@ -61,10 +61,6 @@ class Settings(BaseSettings):
     login_max_attempts: int = 5
     login_block_seconds: int = 900
 
-    #: Рубильник анонимного скачивания из раздела 3.6. Волна ботов лечится
-    #: переключением флага, а не ночным деплоем.
-    guest_access_enabled: bool = True
-
     log_level: str = "INFO"
 
 

@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from arq.connections import RedisSettings, create_pool
 from fastapi import FastAPI
 
-from app.api import auth, downloads, formats, health
+from app.api import admin, auth, downloads, formats, health
 from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging_setup import configure_logging
@@ -55,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router)
     app.include_router(formats.router)
     app.include_router(downloads.router)
+    app.include_router(admin.router)
     return app
 
 

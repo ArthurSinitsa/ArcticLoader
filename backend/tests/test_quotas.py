@@ -9,7 +9,7 @@ Redis настоящий, но в памяти: вся арифметика ве
 import pytest
 from fakeredis import FakeAsyncRedis
 
-from app.services.quotas import Quota, consume
+from app.services.quotas import Quota, consume, refund
 
 #: Гость из таблицы 2.5.2: пачка в один токен, восполнение раз в полчаса.
 GUEST = Quota(daily_limit=5, concurrent_limit=1, bucket_capacity=1, bucket_refill_minutes=30)
@@ -146,4 +146,53 @@ async def test_unlimited_role_is_never_refused(redis: FakeAsyncRedis) -> None:
         assert (await consume(redis, subject="user:root", quota=unlimited, now=HOUR)).allowed
 
     # Безлимитная роль не должна оставлять в Redis ни одного ключа.
+    assert await redis.keys("*") == []
+
+
+async def test_refund_returns_the_token(redis: FakeAsyncRedis) -> None:
+    """Отменённая до скачивания задача не должна стоить пользователю квоты."""
+    await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)
+
+    await refund(redis, subject="guest:abc", quota=GUEST, now=HOUR)
+
+    assert (await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)).allowed
+
+
+async def test_refund_gives_back_the_daily_count(redis: FakeAsyncRedis) -> None:
+    quota = Quota(daily_limit=1, concurrent_limit=1, bucket_capacity=2, bucket_refill_minutes=30)
+    await consume(redis, subject="guest:abc", quota=quota, now=HOUR)
+
+    await refund(redis, subject="guest:abc", quota=quota, now=HOUR)
+
+    assert (await consume(redis, subject="guest:abc", quota=quota, now=HOUR)).allowed
+
+
+async def test_refund_does_not_overfill_the_bucket(redis: FakeAsyncRedis) -> None:
+    """Двойная отмена не должна выдавать больше токенов, чем вмещает ведро."""
+    await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)
+    await refund(redis, subject="guest:abc", quota=GUEST, now=HOUR)
+    await refund(redis, subject="guest:abc", quota=GUEST, now=HOUR)
+
+    assert (await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)).allowed
+    assert not (await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)).allowed
+
+
+async def test_refund_of_untouched_quota_changes_nothing(redis: FakeAsyncRedis) -> None:
+    await refund(redis, subject="guest:abc", quota=GUEST, now=HOUR)
+
+    assert (await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)).allowed
+    assert not (await consume(redis, subject="guest:abc", quota=GUEST, now=HOUR)).allowed
+
+
+async def test_unlimited_role_refund_is_a_no_op(redis: FakeAsyncRedis) -> None:
+    unlimited = Quota(
+        daily_limit=0,
+        concurrent_limit=0,
+        bucket_capacity=0,
+        bucket_refill_minutes=1,
+        unlimited=True,
+    )
+
+    await refund(redis, subject="user:root", quota=unlimited, now=HOUR)
+
     assert await redis.keys("*") == []

@@ -10,7 +10,6 @@ import sqlalchemy as sa
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.config import Settings
 from app.models import Task, TaskStatus
 from tests.conftest import FakeArqPool
 from tests.test_auth import add_user, login
@@ -119,17 +118,6 @@ async def test_different_guests_do_not_share_quota(client: AsyncClient) -> None:
     )
 
     assert response.status_code == 202
-
-
-async def test_guest_access_switch_closes_anonymous_downloads(
-    client: AsyncClient, settings: Settings
-) -> None:
-    """Рубильник раздела 3.6: волна ботов лечится флагом, а не деплоем."""
-    settings.guest_access_enabled = False
-
-    response = await client.post("/api/downloads", json=_payload())
-
-    assert response.status_code == 403
 
 
 async def test_signed_in_user_gets_the_quota_of_their_role(

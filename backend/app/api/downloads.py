@@ -5,17 +5,26 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import ArqDep, Principal, PrincipalDep, SessionDep, SettingsDep
+from app.api.deps import (
+    ADMIN_ROLES,
+    ArqDep,
+    Principal,
+    PrincipalDep,
+    SessionDep,
+    SettingsDep,
+    client_ip,
+)
 from app.config import Settings
 from app.models import TERMINAL_STATUSES, Task, TaskStatus
 from app.schemas import DownloadCreate, DownloadCreated, DownloadHistory, DownloadState
-from app.services import events, quotas, storage
+from app.services import audit, events, flags, quotas, storage
 from app.services import tasks as tasks_repo
 from app.services.ytdlp import user_message
 
@@ -37,7 +46,14 @@ async def create_download(
     settings: SettingsDep,
     principal: PrincipalDep,
 ) -> DownloadCreated:
-    if principal.is_guest and not settings.guest_access_enabled:
+    if await flags.is_on(session, flags.MAINTENANCE):
+        # Очередь дорабатывает начатое, новые задачи не берём — раздел 3.6.
+        # Админку это не закрывает: иначе рубильник нечем будет выключить.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "сервис на техническом обслуживании"
+        )
+
+    if principal.is_guest and not await flags.is_on(session, flags.GUEST_ACCESS):
         # Рубильник раздела 3.6: подозрительная активность лечится флагом.
         raise HTTPException(status.HTTP_403_FORBIDDEN, "анонимное скачивание временно отключено")
 
@@ -107,6 +123,65 @@ async def get_download(
     if task is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "задача не найдена")
     return build_state(task, settings)
+
+
+@router.post("/{task_id}/cancel", status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_download(
+    task_id: uuid.UUID,
+    request: Request,
+    session: SessionDep,
+    arq: ArqDep,
+    principal: PrincipalDep,
+) -> None:
+    """Прервать загрузку — процедура раздела 2.5.3.
+
+    Здесь делается видимая часть: статус, возврат неизрасходованной квоты и
+    команда воркеру. Убить процесс отсюда нельзя — yt-dlp живёт в другом
+    контейнере, и его PID за пределами воркера ничего не значит.
+    """
+    if principal.user is None:
+        # По матрице 2.5.1 отмена — возможность учётной записи, не гостя.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "нужен вход")
+
+    task = await tasks_repo.get_task(session, task_id)
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "задача не найдена")
+
+    is_owner = task.user_id == principal.user_id
+    if not is_owner and principal.role not in ADMIN_ROLES:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "это чужая задача")
+
+    if task.status in TERMINAL_STATUSES:
+        raise HTTPException(status.HTTP_409_CONFLICT, "задача уже завершена")
+
+    # Трафик расходуется только на скачивании: всё, что раньше, отмене не
+    # стоило пользователю ничего, и квоту за это брать не за что.
+    untouched = task.status in (TaskStatus.QUEUED, TaskStatus.EXTRACTING)
+
+    if not await tasks_repo.set_status(
+        session, task_id, TaskStatus.CANCELLED, worker_pid=None, finished_at=_now()
+    ):
+        # Между проверкой и записью задача успела завершиться сама.
+        raise HTTPException(status.HTTP_409_CONFLICT, "задача уже завершена")
+
+    if untouched:
+        await quotas.refund(arq, subject=_subject_of(task), quota=principal.quota)
+
+    await events.request_cancel(arq, task_id)
+
+    if not is_owner:
+        # Журнал — про власть над чужими данными; своя отмена это обычная работа.
+        await audit.record(
+            session,
+            actor_id=principal.user_id,
+            action="task.cancel",
+            target_type="task",
+            target_id=str(task_id),
+            payload={"owner": str(task.user_id), "status": task.status.value},
+            ip=client_ip(request),
+        )
+
+    log.info("задача %s прервана пользователем %s", task_id, principal.user_id)
 
 
 @router.get("/{task_id}/events")
@@ -258,3 +333,12 @@ def _humanize(seconds: int) -> str:
     if seconds >= 60:
         return f"{round(seconds / 60)} мин"
     return f"{seconds} с"
+
+
+def _subject_of(task: Task) -> str:
+    """Чью квоту затронула задача — тот же ключ, что при её создании."""
+    return f"user:{task.user_id}" if task.user_id else f"guest:{task.guest_fingerprint}"
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)

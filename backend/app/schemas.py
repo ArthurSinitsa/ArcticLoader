@@ -90,3 +90,99 @@ class DownloadHistory(BaseModel):
     #: Всего загрузок у пользователя, а не на странице: иначе UI не покажет,
     #: что дальше есть ещё.
     total: int
+
+
+class UserOut(BaseModel):
+    id: uuid.UUID
+    email: str
+    name: str
+    role: str
+    is_active: bool
+    must_change_password: bool
+    created_at: datetime
+    last_login_at: datetime | None
+
+
+class UserPage(BaseModel):
+    items: list[UserOut]
+    total: int
+
+
+class UserCreate(BaseModel):
+    email: str
+    name: str
+    #: По умолчанию обычный пользователь: заводить админов может только
+    #: суперадмин, и это проверяется отдельно.
+    role: str = "user"
+
+
+class UserCreated(BaseModel):
+    user: UserOut
+    #: Показывается ровно один раз — дальше в базе только хеш. Его сообщают
+    #: человеку и требуют сменить при первом входе (раздел 2.6).
+    temporary_password: str
+
+
+class UserUpdate(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+    #: Смена роли доступна только суперадмину — проверяется в обработчике.
+    role: str | None = None
+
+
+class QuotaOut(BaseModel):
+    role: str
+    title: str
+    is_unlimited: bool
+    daily_limit: int
+    concurrent_limit: int
+    bucket_capacity: int
+    bucket_refill_minutes: int
+
+
+class QuotaUpdate(BaseModel):
+    daily_limit: int = Field(ge=0)
+    concurrent_limit: int = Field(ge=0)
+    bucket_capacity: int = Field(ge=0)
+    #: Ноль означал бы деление на ноль при восполнении ведра.
+    bucket_refill_minutes: int = Field(ge=1)
+
+
+class AuditOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    actor_id: uuid.UUID | None
+    action: str
+    target_type: str
+    target_id: str | None
+    payload: dict | None
+    ip: str | None
+    created_at: datetime
+
+
+class AuditPage(BaseModel):
+    items: list[AuditOut]
+
+
+class AdminTaskOut(BaseModel):
+    id: uuid.UUID
+    #: Email владельца; пусто у гостевой загрузки — учётки за ней нет.
+    owner: str | None
+    source_url: str
+    title: str | None
+    quality: str
+    status: TaskStatus
+    progress: float
+    #: Номер процесса yt-dlp: по нему видно, что задача действительно живёт.
+    worker_pid: int | None
+    created_at: datetime
+
+
+class AdminTaskPage(BaseModel):
+    items: list[AdminTaskOut]
+    total: int
+
+
+class FlagUpdate(BaseModel):
+    enabled: bool

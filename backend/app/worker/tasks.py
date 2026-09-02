@@ -1,5 +1,6 @@
 """Задача скачивания."""
 
+import asyncio
 import logging
 import time
 import uuid
@@ -49,6 +50,7 @@ async def download_task(ctx: dict[str, Any], task_id: str) -> None:
                 settings=ctx["settings"],
                 task_id=uuid.UUID(task_id),
                 attempt=ctx.get("job_try", 1),
+                running=ctx.setdefault("running", {}),
             )
             await job.run()
 
@@ -64,12 +66,15 @@ class _Job:
         settings: Settings,
         task_id: uuid.UUID,
         attempt: int,
+        running: dict[uuid.UUID, asyncio.subprocess.Process],
     ) -> None:
         self._session = session
         self._redis = redis
         self._settings = settings
         self._task_id = task_id
         self._attempt = attempt
+        #: Общий на воркер реестр живых процессов — по нему их находит отмена.
+        self._running = running
 
     async def run(self) -> None:
         task = await tasks_repo.get_task(self._session, self._task_id)
@@ -161,9 +166,19 @@ class _Job:
             expected_bytes=formats.estimate_size(info.formats, quality),
         )
 
-        async def remember_pid(pid: int) -> None:
-            # PID нужен, чтобы админ мог прервать задачу — раздел 2.5.3 плана.
-            await tasks_repo.update_task(self._session, self._task_id, worker_pid=pid)
+        try:
+            return await self._run_download(selector, reporter, task)
+        finally:
+            # Процесс завершился — в реестре ему больше не место.
+            self._running.pop(self._task_id, None)
+
+    async def _run_download(self, selector: str, reporter: _ProgressReporter, task: Task) -> Path:
+        async def remember_process(process: asyncio.subprocess.Process) -> None:
+            # Процесс кладём в реестр воркера: команда на отмену приходит в
+            # другой корутине, и остановить ей нужно именно этот процесс.
+            # PID при этом пишется в БД — по нему задачу видно в админке.
+            self._running[self._task_id] = process
+            await tasks_repo.update_task(self._session, self._task_id, worker_pid=process.pid)
 
         return await ytdlp.download(
             task.source_url,
@@ -171,7 +186,7 @@ class _Job:
             format_sort=formats.FORMAT_SORT,
             dest_dir=storage.task_dir(self._settings.media_root, self._task_id),
             timeout=self._settings.download_timeout_seconds,
-            on_start=remember_pid,
+            on_start=remember_process,
             on_progress=reporter.on_progress,
             on_postprocess=self._on_postprocess,
         )
@@ -332,3 +347,35 @@ class _ProgressReporter:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+async def cancel_running(
+    ctx: dict[str, Any], task_id: uuid.UUID, *, grace: float | None = None
+) -> bool:
+    """Остановить процесс задачи и убрать её файлы — шаги 2–4 раздела 2.5.3.
+
+    Канал отмен общий на всех воркеров, поэтому команда о чужой задаче — не
+    ошибка, а обычное дело: у себя её просто не находим.
+    """
+    process = ctx.get("running", {}).pop(task_id, None)
+    if process is None:
+        return False
+
+    with task_context(str(task_id)):
+        log.info("получена команда на прерывание")
+        await ytdlp.terminate_process(process, grace=grace)
+        # Недокачанные `.part` после отмены не нужны никому.
+        storage.remove_task_dir(ctx["settings"].media_root, task_id)
+        log.info("задача прервана, частичные файлы удалены")
+    return True
+
+
+async def watch_cancellations(ctx: dict[str, Any]) -> None:
+    """Фоновая подписка воркера на команды прерывания."""
+    async for task_id in events.listen_cancellations(ctx["redis"]):
+        try:
+            await cancel_running(ctx, task_id)
+        except Exception:
+            # Сорвавшаяся отмена не должна уносить с собой подписку: без неё
+            # воркер перестанет слышать команды вообще.
+            log.exception("не удалось прервать задачу %s", task_id)

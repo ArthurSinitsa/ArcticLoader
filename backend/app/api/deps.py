@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Annotated
 
 from arq.connections import ArqRedis
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -110,3 +110,34 @@ async def _user_by_session(
 
 
 PrincipalDep = Annotated[Principal, Depends(get_principal)]
+
+#: Кто попадает в раздел «Администрирование» — матрица 2.5.1.
+ADMIN_ROLES = frozenset({RoleCode.ADMIN, RoleCode.SUPERADMIN})
+
+
+def _require(principal: Principal, allowed: frozenset[RoleCode]) -> Principal:
+    if principal.user is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "нужен вход")
+    if principal.must_change_password:
+        # Временный пароль знает не только владелец — админка тем более закрыта.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "сначала смените временный пароль")
+    if principal.role not in allowed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "недостаточно прав")
+    return principal
+
+
+async def require_admin(principal: PrincipalDep) -> Principal:
+    return _require(principal, ADMIN_ROLES)
+
+
+async def require_superadmin(principal: PrincipalDep) -> Principal:
+    """Роли, квоты, рубильники и журнал.
+
+    Админ сюда не проходит: иначе он поднимет лимиты себе, повысит себя до
+    суперадмина и подчистит журнал — разделение уровней перестанет работать.
+    """
+    return _require(principal, frozenset({RoleCode.SUPERADMIN}))
+
+
+AdminDep = Annotated[Principal, Depends(require_admin)]
+SuperadminDep = Annotated[Principal, Depends(require_superadmin)]

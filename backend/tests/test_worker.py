@@ -79,6 +79,13 @@ def stub_probe(
     monkeypatch.setattr(ytdlp, "probe", probe)
 
 
+class StubProcess:
+    """Минимум, который воркер спрашивает у процесса, — его номер."""
+
+    pid = 4242
+    returncode = 0
+
+
 def stub_download(monkeypatch: pytest.MonkeyPatch, *, size: int = 1024) -> list[dict[str, Any]]:
     """Подменяет скачивание и возвращает список полученных аргументов."""
     calls: list[dict[str, Any]] = []
@@ -86,7 +93,8 @@ def stub_download(monkeypatch: pytest.MonkeyPatch, *, size: int = 1024) -> list[
     async def download(url: str, **kwargs: Any) -> Path:
         calls.append(kwargs)
         if kwargs.get("on_start"):
-            await kwargs["on_start"](4242)
+            # Колбэк получает процесс: по нему воркер и останавливает загрузку.
+            await kwargs["on_start"](StubProcess())
         if kwargs.get("on_progress"):
             await kwargs["on_progress"](
                 ytdlp.Progress(status="downloading", downloaded_bytes=5, total_bytes=10)

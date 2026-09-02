@@ -85,6 +85,25 @@ return {1, 0, 'ok'}
 """
 
 
+#: Возврат неиспользованного слота: отменённая до скачивания задача не должна
+#: стоить квоты. Ведро не переполняем, суточный счётчик ниже нуля не роняем.
+_REFUND_SCRIPT = """
+local capacity = tonumber(ARGV[1])
+local now = tonumber(ARGV[2])
+
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens'))
+if tokens ~= nil and tokens < capacity then
+    redis.call('HSET', KEYS[1], 'tokens', tokens + 1, 'updated', now)
+end
+
+local used = tonumber(redis.call('GET', KEYS[2]))
+if used ~= nil and used > 0 then
+    redis.call('DECR', KEYS[2])
+end
+return 1
+"""
+
+
 @dataclass(frozen=True)
 class Quota:
     """Строка `quota_profiles` для одной роли."""
@@ -157,3 +176,24 @@ def _seconds_to_midnight(moment: float) -> int:
     point = datetime.fromtimestamp(moment, UTC)
     midnight = (point + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return int((midnight - point).total_seconds())
+
+
+async def refund(redis: Redis, *, subject: str, quota: Quota, now: float | None = None) -> None:
+    """Вернуть слот, занятый задачей, которая так и не началась.
+
+    Раздел 2.5.3: отмена до того, как пошёл трафик, не должна расходовать
+    квоту — иначе пользователь платит за собственную опечатку в ссылке.
+    """
+    if quota.unlimited:
+        return
+
+    moment = time.time() if now is None else now
+    await redis.eval(  # type: ignore[misc]
+        _REFUND_SCRIPT,
+        2,
+        f"{BUCKET_PREFIX}:{subject}",
+        _daily_key(subject, moment),
+        quota.bucket_capacity,
+        moment,
+    )
+    log.info("%s: слот возвращён в квоту", subject)

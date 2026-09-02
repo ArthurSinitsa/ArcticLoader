@@ -1,5 +1,6 @@
 """Точка входа воркера: `arq app.worker.settings.WorkerSettings`."""
 
+import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any, ClassVar
@@ -11,7 +12,7 @@ from app.config import get_settings
 from app.db import create_engine, create_session_factory
 from app.logging_setup import configure_logging
 from app.worker.cleanup import cleanup_task
-from app.worker.tasks import MAX_ATTEMPTS, download_task
+from app.worker.tasks import MAX_ATTEMPTS, download_task, watch_cancellations
 
 log = logging.getLogger(__name__)
 
@@ -26,6 +27,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["engine"] = engine
     ctx["session_factory"] = create_session_factory(engine)
     ctx["settings"] = _settings
+    #: Живые процессы yt-dlp: по этому реестру их находит команда прерывания.
+    ctx["running"] = {}
+    # Подписка на отмены живёт всё время работы воркера: команда приходит
+    # извне, когда загрузка уже идёт (раздел 2.5.3).
+    ctx["cancel_watcher"] = asyncio.create_task(watch_cancellations(ctx))
 
     log.info(
         "воркер запущен: одновременных загрузок %s, каталог %s, файлы живут %s ч",
@@ -36,6 +42,9 @@ async def startup(ctx: dict[str, Any]) -> None:
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
+    watcher = ctx.get("cancel_watcher")
+    if watcher is not None:
+        watcher.cancel()
     await ctx["engine"].dispose()
     log.info("воркер остановлен")
 
