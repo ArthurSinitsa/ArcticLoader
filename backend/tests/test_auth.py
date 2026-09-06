@@ -256,3 +256,47 @@ async def test_block_message_rounds_minutes_up(
     detail = (await login(client)).json()["detail"]
 
     assert f"{detail['retry_after'] // 60} мин" in detail["message"]
+
+
+async def test_temporary_password_change_needs_no_old_one(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Человек только что вошёл этим паролем — второй раз спрашивать незачем."""
+    await add_user(session_factory, must_change_password=True)
+    await login(client)
+
+    response = await client.post("/api/auth/password", json={"new_password": NEW_PASSWORD})
+
+    assert response.status_code == 204
+    async with session_factory() as session:
+        user = await session.scalar(sa.select(User).where(User.email == EMAIL))
+    assert verify_password(NEW_PASSWORD, user.password_hash)
+
+
+async def test_voluntary_change_still_needs_the_old_one(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Иначе уведённая cookie превращается в захват учётки: вор меняет пароль
+    и выкидывает владельца."""
+    await add_user(session_factory)
+    await login(client)
+
+    response = await client.post("/api/auth/password", json={"new_password": NEW_PASSWORD})
+
+    assert response.status_code == 401
+
+
+async def test_wrong_old_password_is_still_refused_after_forced_change(
+    client: AsyncClient, session_factory: async_sessionmaker[AsyncSession]
+) -> None:
+    """Смена сняла флаг — дальше учётка живёт по обычным правилам."""
+    await add_user(session_factory, must_change_password=True)
+    await login(client)
+    await client.post("/api/auth/password", json={"new_password": NEW_PASSWORD})
+
+    response = await client.post(
+        "/api/auth/password",
+        json={"current_password": "не тот", "new_password": "ещё-один-пароль"},
+    )
+
+    assert response.status_code == 401

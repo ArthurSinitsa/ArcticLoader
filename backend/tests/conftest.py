@@ -81,11 +81,21 @@ class FakeArqPool(FakeAsyncRedis):
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
+    """Настройки теста.
+
+    Внешние интеграции гасятся явно: `Settings` читает `.env` и переменные
+    окружения контейнера, поэтому без этого прописанные разработчиком ключи
+    меняли бы поведение тестов — а на другой машине они другие или их нет.
+    """
     return Settings(
         database_url="sqlite+aiosqlite://",
         redis_url="redis://localhost:6379/0",
         media_root=tmp_path / "media",
         public_files_base_url="http://testserver/files",
+        turnstile_site_key="",
+        turnstile_secret_key="",
+        telegram_bot_token="",
+        telegram_alert_chat_id=0,
     )
 
 

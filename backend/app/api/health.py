@@ -7,7 +7,8 @@ import sqlalchemy as sa
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
-from app.api.deps import ArqDep, SessionDep
+from app.api.deps import ArqDep, SessionDep, SettingsDep
+from app.schemas import PublicConfig
 
 log = logging.getLogger(__name__)
 
@@ -37,3 +38,13 @@ async def _probe(name: str, check: Awaitable[object]) -> str:
         log.exception("healthz: %s недоступен", name)
         return ERROR
     return OK
+
+
+@router.get("/api/config")
+async def public_config(settings: SettingsDep) -> PublicConfig:
+    """Что странице нужно знать до входа.
+
+    Сюда попадает только публичное: секретный ключ Turnstile остаётся на
+    сервере, наружу уходит тот, что и так виден в разметке виджета.
+    """
+    return PublicConfig(turnstile_site_key=settings.turnstile_site_key)

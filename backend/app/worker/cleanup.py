@@ -10,13 +10,14 @@
 
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import Task, TaskStatus
+from app.models import RegistrationRequest, RequestStatus, Task, TaskStatus, User
 from app.services import storage
 from app.services import url_meta as url_meta_repo
 
@@ -33,9 +34,17 @@ async def cleanup_task(ctx: dict[str, Any], *, now: datetime | None = None) -> N
         stale = await url_meta_repo.purge_stale(
             session, ttl_seconds=settings.url_meta_ttl_seconds, now=moment
         )
+        burnt = await _burn_unactivated(session, moment)
+        missing = await _forget_missing_files(session, settings)
 
-    if expired or stale:
-        log.info("чистка: истекло загрузок %s, метаданных %s", expired, stale)
+    if expired or stale or burnt or missing:
+        log.info(
+            "чистка: истекло загрузок %s, метаданных %s, учёток %s, потеряно файлов %s",
+            expired,
+            stale,
+            burnt,
+            missing,
+        )
 
 
 async def _expire_due(session: AsyncSession, settings: Settings, now: datetime) -> int:
@@ -66,3 +75,75 @@ async def _expire_due(session: AsyncSession, settings: Settings, now: datetime) 
     if due:
         await session.commit()
     return len(due)
+
+
+async def _burn_unactivated(session: AsyncSession, now: datetime) -> int:
+    """Снести учётки, чей временный пароль так и не сменили, — раздел 2.6.
+
+    «Не активировали — заявка сгорает, учётка не создаётся»: снаружи это
+    выглядит именно так. Заявка при этом остаётся и помечается сгоревшей —
+    по ней видно, что человек до сервиса не дошёл.
+    """
+    due = (
+        await session.scalars(
+            sa.select(User).where(
+                User.must_change_password.is_(True),
+                User.password_expires_at.is_not(None),
+                User.password_expires_at <= now,
+            )
+        )
+    ).all()
+
+    for user in due:
+        request = await session.scalar(
+            sa.select(RegistrationRequest).where(
+                RegistrationRequest.email == user.email,
+                RegistrationRequest.status == RequestStatus.APPROVED,
+            )
+        )
+        if request is not None:
+            request.status = RequestStatus.EXPIRED
+            request.processed_at = now
+        await session.delete(user)
+        log.info("учётка %s не активирована в срок — удалена", user.email)
+
+    if due:
+        await session.commit()
+    return len(due)
+
+
+async def _forget_missing_files(session: AsyncSession, settings: Settings) -> int:
+    """Снять «готово» с задач, чьих файлов больше нет на диске.
+
+    Файл могли удалить мимо сервиса — руками, при переезде каталога или после
+    сбоя диска. Задача при этом остаётся `ready` со ссылкой в никуда, и
+    история обещает то, чего уже нет.
+
+    Если каталога загрузок нет вовсе, не делаем ничего: это почти наверняка
+    непримонтированный том, и «файла нет» окажется верно сразу для всех — так
+    вся история потерялась бы из-за ошибки инфраструктуры, а не по делу.
+    """
+    if not settings.media_root.exists():
+        log.warning("каталог загрузок недоступен — проверку файлов пропускаю")
+        return 0
+
+    candidates = (
+        await session.scalars(
+            sa.select(Task).where(
+                Task.status == TaskStatus.READY,
+                Task.file_path.is_not(None),
+                # У прямой ссылки файла на сервере и не должно быть.
+                Task.direct_url.is_(None),
+            )
+        )
+    ).all()
+
+    lost = [task for task in candidates if not Path(task.file_path).exists()]
+    for task in lost:
+        task.status = TaskStatus.EXPIRED
+        task.file_path = None
+        log.info("файл задачи %s пропал с диска — задача больше не «готова»", task.id)
+
+    if lost:
+        await session.commit()
+    return len(lost)

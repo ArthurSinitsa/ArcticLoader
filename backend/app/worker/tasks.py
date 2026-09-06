@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.logging_setup import task_context
 from app.models import Task, TaskStatus
-from app.services import events, formats, storage, ytdlp
+from app.services import events, formats, notifications, storage, ytdlp
 from app.services import tasks as tasks_repo
 from app.services.formats import Quality
 
@@ -214,6 +214,7 @@ class _Job:
             chosen.format_id,
             chosen.height,
         )
+        await self._notify_owner("Готово: ссылка на файл ждёт в истории загрузок")
 
     async def _finish_file(self, file_path: Path) -> None:
         size = file_path.stat().st_size
@@ -227,6 +228,23 @@ class _Job:
             expires_at=self._deadline(),
         )
         log.info("готово: %s, %.1f МБ", file_path.name, size / 1024 / 1024)
+        await self._notify_owner(f"Готово: {file_path.name}")
+
+    async def _notify_owner(self, text: str) -> None:
+        """Сообщить владельцу в Telegram — ради этого и привязывался чат.
+
+        Уведомление не должно ронять задачу: файл уже скачан, и молчание бота
+        куда меньшая беда, чем потерянный результат.
+        """
+        task = await tasks_repo.get_task(self._session, self._task_id)
+        if task is None:
+            return
+        try:
+            await notifications.notify_owner(
+                self._session, self._redis, user_id=task.user_id, text=text
+            )
+        except Exception:
+            log.exception("не смог поставить уведомление в очередь")
 
     async def _handle_failure(self, code: str, message: str) -> None:
         if code in ytdlp.RETRYABLE_ERRORS and self._attempt < MAX_ATTEMPTS:

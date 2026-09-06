@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
   <title>Arctic Loader</title>
+  <!-- Только виджет проверки: файлы и API через Cloudflare не проходят. -->
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" async defer></script>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
     .row { display: flex; gap: .5rem; margin-bottom: .75rem; }
@@ -51,8 +53,10 @@
   <form id="password-form" class="hidden">
     <div class="hint">Пароль временный — задайте свой, чтобы продолжить.</div>
     <div class="row">
+      <!-- Текущий пароль спрашивается только при добровольной смене: после
+           входа с временным паролем человек его уже ввёл минуту назад. -->
       <input id="password-current" type="password" placeholder="Текущий пароль"
-             autocomplete="current-password" required>
+             autocomplete="current-password" class="hidden">
       <input id="password-new" type="password" placeholder="Новый пароль, от 8 символов"
              autocomplete="new-password" minlength="8" required>
       <button type="submit">Сменить</button>
@@ -69,6 +73,8 @@
       </select>
       <button type="submit" id="submit" disabled>Скачать</button>
     </div>
+    <!-- Виджет появляется, только когда заведены ключи и посетитель не вошёл. -->
+    <div id="turnstile" class="hidden"></div>
   </form>
 
   <div id="title" class="hint"></div>
@@ -81,6 +87,9 @@
 
   <section id="admin" class="hidden">
     <h2>Администрирование</h2>
+
+    <h3>Заявки на доступ</h3>
+    <ul id="admin-requests"></ul>
 
     <h3>Сейчас качается</h3>
     <ul id="admin-tasks"></ul>
@@ -134,10 +143,12 @@
     const signOutButton = document.getElementById("signout");
     const loginForm = document.getElementById("login-form");
     const passwordForm = document.getElementById("password-form");
+    const turnstileBox = document.getElementById("turnstile");
     const historyBox = document.getElementById("history");
     const historyList = document.getElementById("history-list");
     const adminBox = document.getElementById("admin");
     const adminSuper = document.getElementById("admin-super");
+    const adminRequests = document.getElementById("admin-requests");
     const adminTasks = document.getElementById("admin-tasks");
     const adminUsers = document.getElementById("admin-users");
     const adminFlags = document.getElementById("admin-flags");
@@ -170,7 +181,33 @@
 
     // Гость тоже качает (раздел 2.5.1), поэтому вход — не преграда, а кнопка:
     // авторизованному просто положены лимиты повыше.
-    refreshAccount();
+    let turnstileSiteKey = "";
+    let turnstileWidget = null;
+
+    loadPublicConfig().then(refreshAccount);
+
+    async function loadPublicConfig() {
+      try {
+        const config = await request("/api/config");
+        turnstileSiteKey = config.turnstile_site_key;
+      } catch {
+        // Без ключа страница просто не покажет виджет — работать это не мешает.
+      }
+    }
+
+    function setupTurnstile(isGuest) {
+      // Проверку проходят только гости: у вошедшего есть учётка и лимиты роли.
+      const needed = Boolean(turnstileSiteKey) && isGuest;
+      toggle(turnstileBox, needed);
+
+      if (!needed || turnstileWidget !== null || !window.turnstile) return;
+      turnstileWidget = window.turnstile.render(turnstileBox, { sitekey: turnstileSiteKey });
+    }
+
+    function turnstileAnswer() {
+      if (!turnstileSiteKey || turnstileWidget === null) return null;
+      return window.turnstile.getResponse(turnstileWidget) || null;
+    }
 
     signInButton.addEventListener("click", () => toggle(loginForm, true));
     signOutButton.addEventListener("click", async () => {
@@ -199,12 +236,15 @@
 
     passwordForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      const current = document.getElementById("password-current");
       try {
         await request("/api/auth/password", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            current_password: document.getElementById("password-current").value,
+            // Пустое поле не отправляем: сервер сам решит, нужен ли старый
+            // пароль, по флагу принудительной смены.
+            ...(current.value ? { current_password: current.value } : {}),
             new_password: document.getElementById("password-new").value,
           }),
         }, true);
@@ -225,12 +265,16 @@
       toggle(signOutButton, Boolean(user));
       // С временным паролем ничего, кроме его смены, всё равно не работает.
       toggle(passwordForm, Boolean(user && user.must_change_password));
+      // Поле старого пароля нужно только для добровольной смены.
+      toggle(document.getElementById("password-current"), false);
       toggle(form, !user || !user.must_change_password);
 
       // История есть только у авторизованных — матрица 2.5.1.
       const working = Boolean(user && !user.must_change_password);
       toggle(historyBox, working);
       if (working) loadHistory();
+
+      setupTurnstile(!user);
 
       // Раздел администрирования просто не существует для тех, кому не положен.
       const isAdmin = working && ["admin", "superadmin"].includes(user.role);
@@ -240,9 +284,30 @@
     }
 
     async function loadAdmin(role) {
-      await Promise.all([loadAdminTasks(), loadAdminUsers()]);
+      await Promise.all([loadRequests(), loadAdminTasks(), loadAdminUsers()]);
       // Рубильники и журнал — за суперадмином (разделы 2.5.1 и 3.6).
       if (role === "superadmin") await Promise.all([loadFlags(), loadAudit()]);
+    }
+
+    async function loadRequests() {
+      const { items } = await request("/api/admin/requests");
+      adminRequests.replaceChildren(...items.map((item) => {
+        const row = document.createElement("li");
+        const who = item.telegram_username ? `@${item.telegram_username}` : item.telegram_id;
+        row.append(`${item.email} · ${item.name} · ${who}`);
+
+        row.append(button("Одобрить", async () => {
+          // Пароль уходит человеку в бота, а не сюда: админ раздаёт доступ.
+          await request(`/api/admin/requests/${item.id}/approve`, { method: "POST" });
+          await Promise.all([loadRequests(), loadAdminUsers()]);
+        }));
+        row.append(button("Отклонить", async () => {
+          await request(`/api/admin/requests/${item.id}/reject`, { method: "POST" });
+          loadRequests();
+        }));
+        return row;
+      }));
+      if (!items.length) adminRequests.replaceChildren(hint("Заявок нет"));
     }
 
     async function loadAdminTasks() {
@@ -356,6 +421,9 @@
       if (task.status === "ready" && task.download_url) {
         const link = document.createElement("a");
         link.href = task.download_url;
+        // Подстраховка к заголовку Caddy. На ссылку CDN не действует: там
+        // заголовки чужие, и атрибут для другого источника браузер игнорирует.
+        if (!task.direct) link.download = "";
         link.textContent = name;
         item.append(link, ` · ${formatSize(task.file_size)}`);
       } else {
@@ -424,7 +492,11 @@
         const created = await request("/api/downloads", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: urlInput.value, quality: qualitySelect.value }),
+          body: JSON.stringify({
+            url: urlInput.value,
+            quality: qualitySelect.value,
+            turnstile_token: turnstileAnswer(),
+          }),
         });
         watch(created.task_id);
       } catch (error) {

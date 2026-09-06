@@ -10,13 +10,30 @@
 import logging
 import secrets
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import sqlalchemy as sa
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
-from app.api.deps import AdminDep, Principal, SessionDep, SuperadminDep, client_ip
-from app.models import TERMINAL_STATUSES, QuotaProfile, Role, Task, User
+from app.api.deps import (
+    AdminDep,
+    ArqDep,
+    Principal,
+    SessionDep,
+    SettingsDep,
+    SuperadminDep,
+    client_ip,
+)
+from app.models import (
+    TERMINAL_STATUSES,
+    QuotaProfile,
+    RegistrationRequest,
+    RequestStatus,
+    Role,
+    Task,
+    User,
+)
 from app.schemas import (
     AdminTaskOut,
     AdminTaskPage,
@@ -25,6 +42,8 @@ from app.schemas import (
     FlagUpdate,
     QuotaOut,
     QuotaUpdate,
+    RequestOut,
+    RequestPage,
     UserCreate,
     UserCreated,
     UserOut,
@@ -32,7 +51,7 @@ from app.schemas import (
     UserUpdate,
 )
 from app.security import hash_password
-from app.services import audit, flags
+from app.services import audit, flags, notifications, registration, sessions
 from app.services.roles import RoleCode
 
 log = logging.getLogger(__name__)
@@ -140,6 +159,7 @@ async def update_user(
     request: Request,
     admin: AdminDep,
     session: SessionDep,
+    arq: ArqDep,
 ) -> UserOut:
     user, code = await _load_user(session, user_id)
     _ensure_may_touch_role(admin, code)
@@ -162,6 +182,12 @@ async def update_user(
         await session.execute(sa.update(User).where(User.id == user_id).values(**changes))
         await session.commit()
         await session.refresh(user)
+
+        if changes.get("is_active") is False:
+            # Выключение — мягкая форма удаления: доступ обязан пропасть сразу,
+            # а не с ближайшим запросом.
+            await sessions.destroy_all(arq, user_id)
+
         await audit.record(
             session,
             actor_id=admin.user_id,
@@ -177,7 +203,11 @@ async def update_user(
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
-    user_id: uuid.UUID, request: Request, admin: AdminDep, session: SessionDep
+    user_id: uuid.UUID,
+    request: Request,
+    admin: AdminDep,
+    session: SessionDep,
+    arq: ArqDep,
 ) -> None:
     if user_id == admin.user_id:
         # Самый простой способ остаться без единого администратора.
@@ -188,6 +218,10 @@ async def delete_user(
 
     await session.delete(user)
     await session.commit()
+
+    # Учётку удаляют в том числе после инцидента: её сессии должны обрываться
+    # здесь же, а не просто переставать резолвиться до истечения срока.
+    await sessions.destroy_all(arq, user_id)
 
     await audit.record(
         session,
@@ -394,3 +428,125 @@ async def switch_flag(
         ip=client_ip(request),
     )
     return await flags.current(session)
+
+
+@router.get("/requests")
+async def list_requests(
+    admin: AdminDep,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> RequestPage:
+    """Очередь заявок из бота — раздел 2.6."""
+    items = await registration.pending(session, limit=limit, offset=offset)
+    total = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(RegistrationRequest)
+        .where(RegistrationRequest.status == RequestStatus.PENDING)
+    )
+    return RequestPage(items=[RequestOut.model_validate(item) for item in items], total=total)
+
+
+@router.post("/requests/{request_id}/approve")
+async def approve_request(
+    request_id: uuid.UUID,
+    request: Request,
+    admin: AdminDep,
+    session: SessionDep,
+    arq: ArqDep,
+    settings: SettingsDep,
+) -> UserOut:
+    """Одобрить заявку: завести учётку и выслать временный пароль в бота.
+
+    Пароль уходит человеку, а не админу: админ раздаёт доступ, а не пароли.
+    """
+    pending_request = await _pending_request(session, request_id)
+
+    if await session.scalar(sa.select(User.id).where(User.email == pending_request.email)):
+        # Пока заявка ждала, адрес мог занять админ вручную.
+        raise HTTPException(status.HTTP_409_CONFLICT, "такой email уже занят")
+
+    password = secrets.token_urlsafe(TEMPORARY_PASSWORD_BYTES)
+    user = User(
+        email=pending_request.email,
+        name=pending_request.name,
+        # Привязка даёт бесплатный канал для сброса пароля и уведомлений.
+        telegram_id=pending_request.telegram_id,
+        password_hash=hash_password(password),
+        role_id=await _role_id(session, RoleCode.USER),
+        must_change_password=True,
+        # Не активировали за отведённый срок — доступа нет (раздел 2.6).
+        password_expires_at=datetime.now(UTC) + timedelta(hours=settings.temporary_password_hours),
+    )
+    session.add(user)
+    await session.commit()
+    await session.refresh(user)
+
+    await registration.mark_approved(session, request_id, processed_by=admin.user_id)
+    await notifications.publish(
+        arq,
+        chat_id=pending_request.telegram_id,
+        text=(
+            "Заявка одобрена.\n\n"
+            f"Логин: {user.email}\n"
+            f"Временный пароль: {password}\n\n"
+            f"Пароль действует {settings.temporary_password_hours} часов — "
+            "войдите и смените его."
+        ),
+    )
+    await audit.record(
+        session,
+        actor_id=admin.user_id,
+        action="request.approve",
+        target_type="registration_request",
+        target_id=str(request_id),
+        payload={"email": user.email, "telegram_id": pending_request.telegram_id},
+        ip=client_ip(request),
+    )
+
+    return _to_out(user, RoleCode.USER.value)
+
+
+@router.post("/requests/{request_id}/reject")
+async def reject_request(
+    request_id: uuid.UUID,
+    request: Request,
+    admin: AdminDep,
+    session: SessionDep,
+    arq: ArqDep,
+) -> RequestOut:
+    """Отклонить заявку и сказать об этом человеку.
+
+    Молчание в ответ на заявку читается как поломка бота, и человек приходит
+    снова и снова.
+    """
+    pending_request = await _pending_request(session, request_id)
+
+    closed = await registration.reject(session, request_id, processed_by=admin.user_id)
+    await notifications.publish(
+        arq,
+        chat_id=pending_request.telegram_id,
+        text="Заявка отклонена. Если это ошибка, свяжитесь с администратором.",
+    )
+    await audit.record(
+        session,
+        actor_id=admin.user_id,
+        action="request.reject",
+        target_type="registration_request",
+        target_id=str(request_id),
+        payload={"email": pending_request.email},
+        ip=client_ip(request),
+    )
+
+    return RequestOut.model_validate(closed)
+
+
+async def _pending_request(session: SessionDep, request_id: uuid.UUID) -> RegistrationRequest:
+    found = await registration.get(session, request_id)
+    if found is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "заявка не найдена")
+    if found.status is not RequestStatus.PENDING:
+        # Двое админов открыли очередь одновременно — второй не должен
+        # завести дубль учётки.
+        raise HTTPException(status.HTTP_409_CONFLICT, "заявка уже рассмотрена")
+    return found

@@ -57,6 +57,12 @@ services:
     <<: *backend
     command: ["arq", "app.worker.settings.WorkerSettings"]
 
+  # Отдельный процесс: long polling — бесконечный цикл, ему нечего делать
+  # рядом с четырьмя параллельными загрузками. Без токена сам завершится.
+  bot:
+    <<: *backend
+    command: ["python", "-m", "app.services.bot.runner"]
+
   caddy:
     image: caddy:2-alpine
     ports:

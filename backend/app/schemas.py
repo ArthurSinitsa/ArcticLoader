@@ -13,6 +13,9 @@ class DownloadCreate(BaseModel):
     url: HttpUrl
     #: Только профиль из раздела 2.7 — сырой селектор yt-dlp наружу не пускаем.
     quality: Quality = DEFAULT_QUALITY
+    #: Ответ виджета Turnstile. Спрашивается только у гостей и только когда
+    #: заведены ключи (раздел 4.4).
+    turnstile_token: str | None = None
 
 
 class DownloadCreated(BaseModel):
@@ -69,7 +72,9 @@ class LoginRequest(BaseModel):
 
 
 class PasswordChange(BaseModel):
-    current_password: str
+    #: Не нужен при принудительной смене: человек только что вошёл этим самым
+    #: паролем. При добровольной — обязателен, см. `change_password`.
+    current_password: str | None = None
     #: Восемь символов — нижняя граница, ниже которой пароль перебирается
     #: быстрее, чем успеет сработать блокировка входа.
     new_password: str = Field(min_length=8)
@@ -186,3 +191,27 @@ class AdminTaskPage(BaseModel):
 
 class FlagUpdate(BaseModel):
     enabled: bool
+
+
+class PublicConfig(BaseModel):
+    """То, что странице нужно знать о сервере до входа."""
+
+    #: Пустая строка означает, что проверка выключена и виджет не рисуется.
+    turnstile_site_key: str
+
+
+class RequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    telegram_id: int
+    telegram_username: str | None
+    email: str
+    name: str
+    status: str
+    created_at: datetime
+
+
+class RequestPage(BaseModel):
+    items: list[RequestOut]
+    total: int

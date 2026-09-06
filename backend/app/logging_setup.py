@@ -17,6 +17,13 @@ _task_id: ContextVar[str] = ContextVar("task_id", default=NO_TASK)
 
 LOG_FORMAT = "%(asctime)s %(levelname)-8s [%(task_id)s] %(name)s: %(message)s"
 
+#: HTTP-клиенты, которым запрещено писать в лог адреса запросов.
+#:
+#: `httpx` на уровне INFO печатает полный URL, а у Telegram Bot API токен
+#: лежит именно в пути — в `docker compose logs` он оказывался целиком.
+#: Предупреждения и ошибки при этом остаются: они нужны при разборе сбоев.
+HTTP_LOGGERS = ("httpx", "httpcore")
+
 
 class TaskIdFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -53,8 +60,17 @@ def configure_logging(level: str = "INFO") -> None:
             # uvicorn и arq ставят свои обработчики — снимаем их, чтобы всё шло
             # через один формат, иначе в `docker compose logs` каша.
             "loggers": {
-                name: {"handlers": [], "propagate": True}
-                for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "arq")
+                **{
+                    name: {"handlers": [], "propagate": True}
+                    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "arq")
+                },
+                # Уровень задаётся жёстко, а не наследуется: `LOG_LEVEL=DEBUG`
+                # включают, чтобы разобрать свою логику, а не чтобы вывалить
+                # секреты в консоль.
+                **{
+                    name: {"handlers": [], "propagate": True, "level": "WARNING"}
+                    for name in HTTP_LOGGERS
+                },
             },
         }
     )

@@ -34,6 +34,23 @@ TERMINAL_STATUSES = frozenset(
     }
 )
 
+
+class RequestStatus(StrEnum):
+    """Судьба заявки на регистрацию — раздел 2.6."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    #: Одобрили, но человек не активировал пароль за отведённые двое суток.
+    EXPIRED = "expired"
+
+
+request_status_enum = sa.Enum(
+    RequestStatus,
+    name="request_status",
+    values_callable=lambda enum: [member.value for member in enum],
+)
+
 task_status_enum = sa.Enum(
     TaskStatus,
     name="task_status",
@@ -98,6 +115,9 @@ class User(Base):
     role_id: Mapped[int] = mapped_column(sa.ForeignKey("roles.id"))
     #: Пока True, доступ есть только к смене пароля (раздел 2.6).
     must_change_password: Mapped[bool] = mapped_column(sa.Boolean, default=True)
+    #: Докуда действует временный пароль (раздел 2.6: 48 часов). Пусто у
+    #: учёток, где пароль уже сменили, — постоянный пароль не истекает.
+    password_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), server_default=sa.func.now()
@@ -154,6 +174,38 @@ class Task(Base):
 
     def __repr__(self) -> str:
         return f"<Task {self.id} {self.status} {self.source_url!r}>"
+
+
+class RegistrationRequest(Base):
+    """Заявка из Telegram-бота — раздел 2.6.
+
+    Публичной формы регистрации нет: человек оставляет email и имя боту, а
+    учётку заводит админ вручную. Заявка переживает решение — по ней потом
+    видно, кто и когда кого впустил.
+    """
+
+    __tablename__ = "registration_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True, default=uuid.uuid4)
+    telegram_id: Mapped[int] = mapped_column(sa.BigInteger, index=True)
+    telegram_username: Mapped[str | None] = mapped_column(sa.String(64))
+    email: Mapped[str] = mapped_column(sa.String(255), index=True)
+    name: Mapped[str] = mapped_column(sa.String(128))
+
+    status: Mapped[RequestStatus] = mapped_column(
+        request_status_enum, default=RequestStatus.PENDING, index=True
+    )
+    #: Кто решил. Пусто, если решение принял сам сервис — например, срок вышел.
+    processed_by: Mapped[uuid.UUID | None] = mapped_column(
+        sa.ForeignKey("users.id", ondelete="SET NULL")
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), server_default=sa.func.now(), index=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<RegistrationRequest {self.email} {self.status}>"
 
 
 class AuditEntry(Base):

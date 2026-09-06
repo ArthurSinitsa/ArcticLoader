@@ -74,6 +74,14 @@ async def login(
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "учётная запись отключена")
 
+    if _password_expired(user):
+        # Пароль прошёл через бота и, возможно, через переписку — вечно жить
+        # он не может (раздел 2.6). Учётку заберёт чистка.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "срок действия временного пароля истёк — обратитесь к администратору",
+        )
+
     await login_guard.reset(arq, ip=ip, login=payload.email)
     await _open_session(response, session, arq, settings, user)
     log.info("вход выполнен: %s", user.email)
@@ -115,14 +123,25 @@ async def change_password(
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "нужен вход")
 
-    if not verify_password(payload.current_password, user.password_hash):
-        # Без этой проверки уведённая cookie превращается в захват учётки.
+    # Добровольная смена требует старый пароль: без этой проверки уведённая
+    # cookie превращается в захват учётки — вор сменит пароль и выкинет
+    # владельца. При принудительной не спрашиваем: человек минуту назад вошёл
+    # этим самым паролем, и второй ввод — просто лишнее трение.
+    if not user.must_change_password and not (
+        payload.current_password and verify_password(payload.current_password, user.password_hash)
+    ):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "текущий пароль неверен")
 
     await session.execute(
         sa.update(User)
         .where(User.id == user.id)
-        .values(password_hash=hash_password(payload.new_password), must_change_password=False)
+        .values(
+            password_hash=hash_password(payload.new_password),
+            must_change_password=False,
+            # Пароль стал постоянным: срока у него больше нет, иначе людей
+            # выкидывало бы раз в двое суток.
+            password_expires_at=None,
+        )
     )
     await session.commit()
 
@@ -160,3 +179,14 @@ async def _open_session(
             sa.update(User).where(User.id == user.id).values(last_login_at=datetime.now(UTC))
         )
         await session.commit()
+
+
+def _password_expired(user: User) -> bool:
+    """Истёк ли временный пароль. У постоянного срока нет вовсе."""
+    if user.password_expires_at is None:
+        return False
+    # SQLite в тестах хранит время без зоны, Postgres — с ней.
+    deadline = user.password_expires_at
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)
+    return deadline <= datetime.now(UTC)

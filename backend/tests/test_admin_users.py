@@ -6,7 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models import AuditEntry, User
 from app.security import verify_password
+from app.services import sessions
 from app.services.roles import RoleCode
+from tests.conftest import FakeArqPool
 from tests.test_auth import add_user, login
 
 ADMIN = "admin@example.com"
@@ -252,3 +254,35 @@ async def test_creation_is_written_to_the_journal(
     assert entry is not None
     # Пароль в журнал не попадает: журнал читают чаще, чем заводят учётки.
     assert "password" not in str(entry.payload)
+
+
+async def test_deleted_account_loses_its_sessions(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    arq_pool: FakeArqPool,
+) -> None:
+    """Учётку удаляют в том числе после инцидента: её сессии должны обрываться
+    сразу, а не висеть в Redis до истечения срока."""
+    await sign_in_admin(client, session_factory, role=RoleCode.SUPERADMIN, email=SUPER)
+    victim = await add_user(session_factory)
+    token = await sessions.create(arq_pool, victim.id, ttl=3600)
+
+    await client.delete(f"/api/admin/users/{victim.id}")
+
+    assert await sessions.resolve(arq_pool, token, ttl=3600) is None
+    assert await arq_pool.keys(f"{sessions.USER_SESSIONS_PREFIX}:{victim.id}") == []
+
+
+async def test_disabled_account_loses_its_sessions(
+    client: AsyncClient,
+    session_factory: async_sessionmaker[AsyncSession],
+    arq_pool: FakeArqPool,
+) -> None:
+    """Выключение — мягкая форма того же: доступ должен пропадать немедленно."""
+    await sign_in_admin(client, session_factory)
+    victim = await add_user(session_factory)
+    token = await sessions.create(arq_pool, victim.id, ttl=3600)
+
+    await client.patch(f"/api/admin/users/{victim.id}", json={"is_active": False})
+
+    assert await sessions.resolve(arq_pool, token, ttl=3600) is None

@@ -24,7 +24,7 @@ from app.api.deps import (
 from app.config import Settings
 from app.models import TERMINAL_STATUSES, Task, TaskStatus
 from app.schemas import DownloadCreate, DownloadCreated, DownloadHistory, DownloadState
-from app.services import audit, events, flags, quotas, storage
+from app.services import audit, events, flags, quotas, storage, turnstile
 from app.services import tasks as tasks_repo
 from app.services.ytdlp import user_message
 
@@ -41,6 +41,7 @@ HEARTBEAT_SECONDS = 15.0
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
 async def create_download(
     payload: DownloadCreate,
+    request: Request,
     session: SessionDep,
     arq: ArqDep,
     settings: SettingsDep,
@@ -56,6 +57,21 @@ async def create_download(
     if principal.is_guest and not await flags.is_on(session, flags.GUEST_ACCESS):
         # Рубильник раздела 3.6: подозрительная активность лечится флагом.
         raise HTTPException(status.HTTP_403_FORBIDDEN, "анонимное скачивание временно отключено")
+
+    if principal.is_guest and settings.turnstile_secret_key:
+        # Гостевой отпечаток меняется одним кликом, поэтому одних квот мало:
+        # без проверки бот крутит загрузки, пока площадка не забанит наш IP.
+        # У авторизованного есть учётка и имя в журнале — его не спрашиваем.
+        # Пустой токен — заведомо не пропуск: в Cloudflare за этим не ходим.
+        passed = bool(payload.turnstile_token) and await turnstile.verify(
+            secret=settings.turnstile_secret_key,
+            token=payload.turnstile_token,
+            ip=client_ip(request),
+        )
+        if not passed:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "проверка не пройдена, обновите страницу"
+            )
 
     if principal.must_change_password:
         # Временный пароль знает не только владелец (раздел 2.6): до смены
